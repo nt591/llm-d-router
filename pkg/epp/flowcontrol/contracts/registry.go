@@ -188,6 +188,8 @@ type PriorityBandStats struct {
 	CapacityBytes uint64
 	// CapacityRequests is the configured maximum total request count for this priority band.
 	CapacityRequests uint64
+	// RejectOnGlobalSaturation indicates whether new requests are rejected when pool saturation is at least 1.0.
+	RejectOnGlobalSaturation bool
 	// ByteSize is the total byte size of items currently queued in this priority band.
 	ByteSize uint64
 	// Len is the total number of items currently queued in this priority band.

@@ -99,6 +99,9 @@ type Processor struct {
 	// synchronization.
 	ceilings []float64
 
+	// globalSaturation is the most recent detector sample. The processor run goroutine is its sole reader and writer.
+	globalSaturation float64
+
 	// wg is used to wait for background tasks (cleanup sweep) to complete on shutdown.
 	wg             sync.WaitGroup
 	isShuttingDown atomic.Bool
@@ -323,9 +326,20 @@ func (p *Processor) enqueue(item *FlowItem) {
 		return
 	}
 
+	stats := p.registry.Stats()
+	bandStats, ok := stats.PerPriorityBandStats[key.Priority]
+	if ok && bandStats.RejectOnGlobalSaturation && p.globalSaturation >= 1.0 && !p.regime.Load().empty {
+		p.logger.V(logutil.DEBUG).Info("Rejecting request at global saturation",
+			"flowKey", key, "requestID", req.ID(), "saturation", p.globalSaturation)
+		item.FinalizeWithOutcome(types.QueueOutcomeRejectedCapacity, fmt.Errorf("%w: %w",
+			types.ErrRejected, types.ErrGlobalSaturation))
+		p.recordDrop(types.QueueOutcomeRejectedCapacity)
+		return
+	}
+
 	// --- Capacity Check ---
 	// This check is safe because it is performed by the single-writer Run goroutine.
-	if ok, stats := p.hasCapacity(key.Priority, req.ByteSize()); !ok {
+	if ok := hasCapacity(stats, key.Priority, req.ByteSize()); !ok {
 		// When the pool has no endpoints, the queue is acting as a scale-from-zero waiting room. A capacity rejection in
 		// that state reflects genuine unavailability (surfaced as 503), not backpressure against a contended pool (429).
 		if p.regime.Load().empty {
@@ -367,25 +381,29 @@ func (p *Processor) enqueue(item *FlowItem) {
 // physical resource overcommitment.
 func (p *Processor) hasCapacity(priority int, itemByteSize uint64) (bool, contracts.AggregateStats) {
 	stats := p.registry.Stats()
+	return hasCapacity(stats, priority, itemByteSize), stats
+}
+
+func hasCapacity(stats contracts.AggregateStats, priority int, itemByteSize uint64) bool {
 	if stats.TotalCapacityBytes > 0 && stats.TotalByteSize+itemByteSize > stats.TotalCapacityBytes {
-		return false, stats
+		return false
 	}
 	if stats.TotalCapacityRequests > 0 && stats.TotalLen+1 > stats.TotalCapacityRequests {
-		return false, stats
+		return false
 	}
 
 	bandStats, ok := stats.PerPriorityBandStats[priority]
 	if !ok {
-		return false, stats
+		return false
 	}
 	if bandStats.CapacityBytes > 0 && bandStats.ByteSize+itemByteSize > bandStats.CapacityBytes {
-		return false, stats
+		return false
 	}
 	if bandStats.CapacityRequests > 0 && bandStats.Len+1 > bandStats.CapacityRequests {
-		return false, stats
+		return false
 	}
 
-	return true, stats
+	return true
 }
 
 // recordCapacityUtilization emits occupancy/effective-capacity ratio gauges per priority band (aggregated over every
@@ -444,6 +462,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 		p.regime.Store(&regimeSample{empty: empty, since: p.clock.Now()})
 	}
 	saturation := p.saturationDetector.Saturation(ctx, pool)
+	p.globalSaturation = saturation
 
 	// Record pool saturation metric
 	metrics.RecordFlowControlPoolSaturation(p.poolName, saturation)
