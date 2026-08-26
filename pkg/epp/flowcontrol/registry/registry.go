@@ -443,11 +443,12 @@ func (fr *FlowRegistry) Stats() contracts.AggregateStats {
 		bandStats := value.(*bandStats)
 		bandCfg := fr.config.PriorityBands[priority]
 		stats.PerPriorityBandStats[priority] = contracts.PriorityBandStats{
-			Priority:         priority,
-			CapacityBytes:    bandCfg.MaxBytes,
-			CapacityRequests: bandCfg.MaxRequests,
-			ByteSize:         uint64(bandStats.byteSize.Load()),
-			Len:              uint64(bandStats.len.Load()),
+			Priority:                 priority,
+			CapacityBytes:            bandCfg.MaxBytes,
+			CapacityRequests:         bandCfg.MaxRequests,
+			RejectOnGlobalSaturation: bandCfg.RejectOnGlobalSaturation,
+			ByteSize:                 uint64(bandStats.byteSize.Load()),
+			Len:                      uint64(bandStats.len.Load()),
 		}
 		return true
 	})
