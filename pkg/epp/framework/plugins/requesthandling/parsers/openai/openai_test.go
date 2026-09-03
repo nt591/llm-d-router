@@ -63,10 +63,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				Completions: &fwkrh.CompletionsRequest{
 					Prompt: fwkrh.Prompt{Raw: "test prompt"},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model":  "test",
-					"prompt": "test prompt",
-				},
 			},
 		},
 		{
@@ -79,10 +75,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				Completions: &fwkrh.CompletionsRequest{
 					Prompt: fwkrh.Prompt{Strings: []string{"Why is the sky blue?"}},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model":  "test",
-					"prompt": []any{"Why is the sky blue?"},
 				},
 			},
 		},
@@ -97,10 +89,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				Completions: &fwkrh.CompletionsRequest{
 					Prompt: fwkrh.Prompt{Strings: []string{"prompt1", "prompt2"}},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model":  "test",
-					"prompt": []any{"prompt1", "prompt2"},
-				},
 			},
 		},
 		{
@@ -113,10 +101,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				Completions: &fwkrh.CompletionsRequest{
 					Prompt: fwkrh.Prompt{TokenIDs: []uint32{1, 2, 3}},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model":  "test",
-					"prompt": []any{float64(1), float64(2), float64(3)},
 				},
 			},
 		},
@@ -148,17 +132,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					Messages: []fwkrh.Message{
 						{Role: "system", Content: fwkrh.Content{Raw: "this is a system message"}},
 						{Role: "user", Content: fwkrh.Content{Raw: "hello"}},
-					},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model": "test",
-					"messages": []any{
-						map[string]any{
-							"role": "system", "content": "this is a system message",
-						},
-						map[string]any{
-							"role": "user", "content": "hello",
-						},
 					},
 				},
 			},
@@ -209,26 +182,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 						},
 					},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "test",
-					"messages": []any{
-						map[string]any{"role": "user", "content": "List files"},
-						map[string]any{
-							"role":    "assistant",
-							"content": "Reflection.",
-							"tool_calls": []any{
-								map[string]any{
-									"id":   "chatcmpl-tool-1",
-									"type": "function",
-									"function": map[string]any{
-										"name":      "bash",
-										"arguments": `{"command":"ls -la"}`,
-									},
-								},
-							},
-						},
-					},
-				},
 			},
 		},
 		{
@@ -241,10 +194,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				ChatCompletions: &fwkrh.ChatCompletionsRequest{
 					Messages: []fwkrh.Message{{Role: "user", Content: fwkrh.Content{Raw: "hi"}}},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model":    "test",
-					"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 				},
 			},
 		},
@@ -259,10 +208,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				ChatCompletions: &fwkrh.ChatCompletionsRequest{
 					Messages: []fwkrh.Message{{Role: "user", Content: fwkrh.Content{Raw: "hi"}}},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model":    "test",
-					"messages": []any{map[string]any{"role": "user", "content": "hi"}},
-				},
 			},
 		},
 		{
@@ -275,10 +220,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				Completions: &fwkrh.CompletionsRequest{
 					Prompt: fwkrh.Prompt{Raw: "render this"},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model":  "test",
-					"prompt": "render this",
 				},
 			},
 		},
@@ -304,18 +245,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 							{Type: "image_url", ImageURL: fwkrh.ImageBlock{URL: "data:image/png;base64,abc"}},
 							{Type: "text", Text: "describe"},
 						}}},
-					},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model": "test",
-					"messages": []any{
-						map[string]any{
-							"role": "user",
-							"content": []any{
-								map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,abc"}},
-								map[string]any{"type": "text", "text": "describe"},
-							},
-						},
 					},
 				},
 			},
@@ -369,30 +298,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 						}},
 					},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "test",
-					"messages": []any{
-						map[string]any{
-							"role": "system",
-							"content": []any{
-								map[string]any{
-									"type": "text",
-									"text": "Describe this image in one sentence.",
-								},
-							},
-						},
-						map[string]any{
-							"role": "user",
-							"content": []any{map[string]any{
-								"type": "image_url",
-								"image_url": map[string]any{
-									"url": "https://example.com/images/dui.jpg.",
-								},
-							},
-							},
-						},
-					},
-				},
 			},
 		},
 		{
@@ -438,29 +343,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 						}},
 					},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "test",
-					"messages": []any{
-						map[string]any{
-							"role": "user",
-							"content": []any{
-								map[string]any{
-									"type": "input_audio",
-									"input_audio": map[string]any{
-										"data":   "base64data",
-										"format": "wav",
-									},
-								},
-								map[string]any{
-									"type": "video_url",
-									"video_url": map[string]any{
-										"url": "https://example.com/video.mp4",
-									},
-								},
-							},
-						},
-					},
-				},
 			},
 		},
 		{
@@ -489,19 +371,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					ContinueFinalMessage:      true,
 					AddGenerationPrompt:       true,
 					ChatTemplateKWArgs:        map[string]any{"key": "value"},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model": "test",
-					"messages": []any{
-						map[string]any{"role": "user", "content": "hello"},
-					},
-					"tools":                        []any{map[string]any{"type": "function"}},
-					"documents":                    []any{map[string]any{"content": "doc"}},
-					"chat_template":                "custom template",
-					"return_assistant_tokens_mask": true,
-					"continue_final_message":       true,
-					"add_generation_prompt":        true,
-					"chat_template_kwargs":         map[string]any{"key": "value"},
 				},
 			},
 		},
@@ -665,11 +534,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					Prompt:    fwkrh.Prompt{Raw: "test prompt"},
 					CacheSalt: "Z3V2bmV3aGxza3ZubGFoZ3Zud3V3ZWZ2bmd0b3V2bnZmc2xpZ3RoZ2x2aQ==",
 				},
-				Payload: fwkrh.PayloadMap{
-					"model":      "test",
-					"prompt":     "test prompt",
-					"cache_salt": "Z3V2bmV3aGxza3ZubGFoZ3Zud3V3ZWZ2bmd0b3V2bnZmc2xpZ3RoZ2x2aQ==",
-				},
 			},
 		},
 		{
@@ -695,18 +559,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					},
 					CacheSalt: "Z3V2bmV3aGxza3ZubGFoZ3Zud3V3ZWZ2bmd0b3V2bnZmc2xpZ3RoZ2x2aQ==",
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "test",
-					"messages": []any{
-						map[string]any{
-							"role": "system", "content": "this is a system message",
-						},
-						map[string]any{
-							"role": "user", "content": "hello",
-						},
-					},
-					"cache_salt": "Z3V2bmV3aGxza3ZubGFoZ3Zud3V3ZWZ2bmd0b3V2bnZmc2xpZ3RoZ2x2aQ==",
-				},
 			},
 		},
 		{
@@ -722,11 +574,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					Input:        "How do I check if a Python object is an instance of a class?",
 					Instructions: "You are a coding assistant that talks like a pirate.",
 				},
-				Payload: fwkrh.PayloadMap{
-					"model":        "gpt-4o",
-					"input":        "How do I check if a Python object is an instance of a class?",
-					"instructions": "You are a coding assistant that talks like a pirate.",
-				},
 			},
 		},
 		{
@@ -741,11 +588,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				Responses: &fwkrh.ResponsesRequest{
 					Input:     "test input",
 					CacheSalt: "abc123",
-				},
-				Payload: fwkrh.PayloadMap{
-					"model":      "gpt-4o",
-					"input":      "test input",
-					"cache_salt": "abc123",
 				},
 			},
 		},
@@ -774,10 +616,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 						{Type: "message", Role: "user", Content: "Hello"},
 					},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "gpt-4o",
-					"items": []any{map[string]any{"type": "message", "role": "user", "content": "Hello"}},
-				},
 			},
 		},
 		{
@@ -795,12 +633,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 						{Type: "message", Role: "user", Content: "Hello"},
 					},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "gpt-4o",
-					"items": []any{
-						map[string]any{"type": "message", "role": "user", "content": "Hello"},
-					},
-				},
 			},
 		},
 		{
@@ -813,10 +645,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				Completions: &fwkrh.CompletionsRequest{
 					Prompt: fwkrh.Prompt{Raw: "test prompt"},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model":  "gpt-4o",
-					"prompt": "test prompt",
 				},
 			},
 		},
@@ -834,13 +662,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				ChatCompletions: &fwkrh.ChatCompletionsRequest{
 					Messages: []fwkrh.Message{{Role: "user", Content: fwkrh.Content{Raw: "hello"}}},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "test",
-					"messages": []any{
-						map[string]any{"role": "user", "content": "hello"},
-					},
-					"stream": true,
-				},
 				Stream: true,
 			},
 		},
@@ -856,10 +677,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				Embeddings: &fwkrh.EmbeddingsRequest{
 					Input: fwkrh.EmbeddingsInput{Raw: "The food was delicious and the waiter..."},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "text-embedding-3-small",
-					"input": "The food was delicious and the waiter...",
-				},
 			},
 		},
 		{
@@ -873,10 +690,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				Embeddings: &fwkrh.EmbeddingsRequest{
 					Input: fwkrh.EmbeddingsInput{Strings: []string{"First document", "Second document"}},
 				},
-				Payload: fwkrh.PayloadMap{
-					"model": "text-embedding-3-small",
-					"input": []any{"First document", "Second document"},
-				},
 			},
 		},
 		{
@@ -889,10 +702,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				Embeddings: &fwkrh.EmbeddingsRequest{
 					Input: fwkrh.EmbeddingsInput{TokenIDs: []uint32{1, 2, 3}},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model": "text-embedding-3-small",
-					"input": []any{float64(1), float64(2), float64(3)},
 				},
 			},
 		},
@@ -909,11 +718,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					Input:     fwkrh.EmbeddingsInput{Raw: "embed this text"},
 					CacheSalt: "embeddings-salt-123",
 				},
-				Payload: fwkrh.PayloadMap{
-					"model":      "text-embedding-3-small",
-					"input":      "embed this text",
-					"cache_salt": "embeddings-salt-123",
-				},
 			},
 		},
 		{
@@ -926,10 +730,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				Embeddings: &fwkrh.EmbeddingsRequest{
 					Input: fwkrh.EmbeddingsInput{Raw: "text to embed"},
-				},
-				Payload: fwkrh.PayloadMap{
-					"model": "text-embedding-3-small",
-					"input": "text to embed",
 				},
 			},
 		},
@@ -971,17 +771,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					Size:              "1024x1024",
 					NumInferenceSteps: ptr.To[int64](30),
 				},
-				Payload: fwkrh.PayloadMap{
-					"model":               "test-image-model",
-					"prompt":              "a cat wearing a spacesuit",
-					"negative_prompt":     "blurry",
-					"n":                   float64(2),
-					"size":                "1024x1024",
-					"response_format":     "b64_json",
-					"num_inference_steps": float64(30),
-					"guidance_scale":      7.5,
-					"seed":                float64(42),
-				},
 			},
 		},
 		{
@@ -993,9 +782,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				Images: &fwkrh.ImagesGenerationsRequest{
 					Prompt: "a dog",
-				},
-				Payload: fwkrh.PayloadMap{
-					"prompt": "a dog",
 				},
 			},
 		},
@@ -1009,10 +795,6 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			want: &fwkrh.InferenceRequestBody{
 				Images: &fwkrh.ImagesGenerationsRequest{
 					Prompt: "a dragon",
-				},
-				Payload: fwkrh.PayloadMap{
-					"model":  "test-image-model",
-					"prompt": "a dragon",
 				},
 			},
 		},
@@ -1057,6 +839,8 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 
 			// Model is extracted from the request body's "model" field.
 			tt.want.Model, _ = tt.body["model"].(string)
+			// Payload forwards the original request bytes verbatim.
+			tt.want.Payload = fwkrh.RawJSONPayload(bodyBytes)
 
 			if diff := cmp.Diff(tt.want, got.Body); diff != "" {
 				t.Errorf("ParseRequest() mismatch (-want +got):\n%s", diff)
@@ -1598,6 +1382,23 @@ func TestOpenAIParser_ParseRequest_MaxOutputTokens(t *testing.T) {
 			headers: map[string]string{":path": "/v1/completions"},
 			body:    map[string]any{"model": "m", "prompt": "p", "max_tokens": float64(-5)},
 			want:    nil,
+		},
+		{
+			name:    "null ignored",
+			headers: map[string]string{":path": "/v1/completions"},
+			body:    map[string]any{"model": "m", "prompt": "p", "max_tokens": nil},
+			want:    nil,
+		},
+		{
+			name:    "null max_completion_tokens falls back to max_tokens",
+			headers: map[string]string{":path": "/v1/chat/completions"},
+			body: map[string]any{
+				"model":                 "m",
+				"messages":              []any{map[string]any{"role": "user", "content": "hi"}},
+				"max_completion_tokens": nil,
+				"max_tokens":            float64(50),
+			},
+			want: ptr.To(int64(50)),
 		},
 	}
 

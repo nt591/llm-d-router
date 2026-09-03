@@ -148,6 +148,9 @@ func completionsPayload(body *fwkrh.InferenceRequestBody) fwkrh.RequestPayload {
 		if _, ok := body.Payload.AsMap(); ok {
 			return body.Payload
 		}
+		if pm, ok := rawToPayloadMap(body.Payload); ok {
+			return pm
+		}
 	}
 	prompt := body.Completions.Prompt
 	if len(prompt.Strings) > 1 {
@@ -164,11 +167,30 @@ func chatPayload(body *fwkrh.InferenceRequestBody) fwkrh.RequestPayload {
 		if _, ok := body.Payload.AsMap(); ok {
 			return body.Payload
 		}
+		if pm, ok := rawToPayloadMap(body.Payload); ok {
+			return pm
+		}
 	}
 	data, _ := json.Marshal(buildChatRenderRequest(ChatCompletionsToRenderChatRequest(body.ChatCompletions)))
 	var pm fwkrh.PayloadMap
 	_ = json.Unmarshal(data, &pm)
 	return pm
+}
+
+// rawToPayloadMap decodes a RawJSONPayload into a full PayloadMap so the render
+// path forwards every field verbatim, keeping token parity with the body the
+// serving pod receives. The decode runs here, off the pre-queue admission path,
+// rather than at parse time.
+func rawToPayloadMap(p fwkrh.RequestPayload) (fwkrh.PayloadMap, bool) {
+	raw, ok := p.(fwkrh.RawJSONPayload)
+	if !ok {
+		return nil, false
+	}
+	var pm fwkrh.PayloadMap
+	if err := json.Unmarshal(raw, &pm); err != nil {
+		return nil, false
+	}
+	return pm, true
 }
 
 // messagesPayload returns the payload for an Anthropic Messages request. The raw

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -113,52 +114,89 @@ func (p *OpenAIParser) WithName(name string) *OpenAIParser {
 	return p
 }
 
-// ParseRequest parses the request body and headers and returns a map representation.
+// ParseRequest decodes the body once into the typed body and forwards the
+// original bytes as the payload, so the payload is never materialized as a map.
 func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers map[string]string) (*fwkrh.ParseResult, error) {
-	bodyMap := make(map[string]any)
-	if err := json.Unmarshal(body, &bodyMap); err != nil {
-		return nil, fmt.Errorf("error unmarshaling request bodyMap: %w", err)
-	}
 	apiType := determineAPITypeFromPath(request.GetRequestPath(headers))
 	extractedBody, err := extractRequestBody(apiType, body)
 	if err != nil {
 		return nil, err
 	}
-	extractedBody.Payload = fwkrh.PayloadMap(bodyMap)
-	if model, ok := bodyMap["model"].(string); ok {
-		extractedBody.Model = model
-	}
-	extractedBody.MaxOutputTokens = maxOutputTokensForAPI(apiType, bodyMap)
-	if stream, ok := bodyMap["stream"].(bool); ok && stream {
-		extractedBody.Stream = true
-	}
+	extractedBody.Payload = fwkrh.RawJSONPayload(body)
 	return &fwkrh.ParseResult{Body: extractedBody, SkipResponseProcessing: false}, nil
 }
 
-// RewriteModelName writes the resolved model into the request payload map.
+// RewriteModelName writes the resolved model into the payload. A RawJSONPayload
+// is shallow-decoded (top-level keys only) to avoid materializing nested content;
+// a PayloadMap, set once a plugin mutates the body, is edited in place.
 func (p *OpenAIParser) RewriteModelName(payload fwkrh.MarshalablePayload, model string) (fwkrh.MarshalablePayload, error) {
-	m, ok := payload.(fwkrh.PayloadMap)
-	if !ok {
+	switch v := payload.(type) {
+	case fwkrh.PayloadMap:
+		v["model"] = model
+		return v, nil
+	case fwkrh.RawJSONPayload:
+		top := make(map[string]json.RawMessage)
+		if err := json.Unmarshal(v, &top); err != nil {
+			return nil, fmt.Errorf("rewriting model name: %w", err)
+		}
+		encoded, err := json.Marshal(model)
+		if err != nil {
+			return nil, err
+		}
+		top["model"] = encoded
+		out, err := json.Marshal(top)
+		if err != nil {
+			return nil, err
+		}
+		return fwkrh.RawJSONPayload(out), nil
+	default:
 		return payload, nil
 	}
-	m["model"] = model
-	return m, nil
 }
 
-// maxOutputTokensForAPI normalizes the per-API output-token cap field into a
-// single value, applying each API's field name and precedence. Endpoints with no
-// output-token concept (conversations, embeddings) return nil.
-func maxOutputTokensForAPI(apiType string, bodyMap map[string]any) *int64 {
-	switch apiType {
-	case chatCompletionsAPI:
-		return fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_completion_tokens", "max_tokens")
-	case completionsAPI:
-		return fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_tokens")
-	case responsesAPI:
-		return fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_output_tokens")
-	default:
-		return nil
+// commonScalars holds the top-level scalars shared across OpenAI APIs. They are
+// kept as raw bytes and coerced leniently so a malformed value reads as absent
+// instead of failing the whole parse.
+type commonScalars struct {
+	Model  json.RawMessage `json:"model"`
+	Stream json.RawMessage `json:"stream"`
+}
+
+func (s commonScalars) model() string {
+	var v string
+	if len(s.Model) == 0 || json.Unmarshal(s.Model, &v) != nil {
+		return ""
 	}
+	return v
+}
+
+func (s commonScalars) stream() bool {
+	var v bool
+	if len(s.Stream) == 0 || json.Unmarshal(s.Stream, &v) != nil {
+		return false
+	}
+	return v
+}
+
+// maxOutputTokens returns the first raw value that is a non-negative whole
+// number; precedence follows argument order. Absent, null, and malformed values
+// are skipped. Decoding into *float64 leaves null as nil rather than zero.
+func maxOutputTokens(raws ...json.RawMessage) *int64 {
+	for _, raw := range raws {
+		if len(raw) == 0 {
+			continue
+		}
+		var f *float64
+		if json.Unmarshal(raw, &f) != nil || f == nil {
+			continue
+		}
+		if *f < 0 || *f != math.Trunc(*f) {
+			continue
+		}
+		out := int64(*f)
+		return &out
+	}
+	return nil
 }
 
 // ParseResponse extracts usage metadata from the provider's response.
@@ -246,56 +284,92 @@ func determineAPITypeFromPath(path string) string {
 	return completionsAPI
 }
 
-// extractRequestBody extracts the InferenceRequestBody from the given raw body
-// for the already-resolved API type.
+// extractRequestBody decodes the raw body once into the typed body for the
+// already-resolved API type, folding the model/stream/max-output scalars into the
+// same pass. The per-API wrapper embeds the typed request struct so its custom
+// unmarshalers still run.
 func extractRequestBody(apiType string, rawBody []byte) (*fwkrh.InferenceRequestBody, error) {
 	switch apiType {
 	case conversationsAPI:
-		var conversations fwkrh.ConversationsRequest
-		if err := json.Unmarshal(rawBody, &conversations); err == nil && len(conversations.Items) > 0 {
-			return &fwkrh.InferenceRequestBody{Conversations: &conversations}, nil
+		var req struct {
+			fwkrh.ConversationsRequest
+			commonScalars
 		}
-		return nil, errors.New("invalid conversations request: must have items field")
+		if err := json.Unmarshal(rawBody, &req); err != nil || len(req.Items) == 0 {
+			return nil, errors.New("invalid conversations request: must have items field")
+		}
+		conversations := req.ConversationsRequest
+		return withScalars(&fwkrh.InferenceRequestBody{Conversations: &conversations}, req.commonScalars, nil), nil
 
 	case responsesAPI:
-		var responses fwkrh.ResponsesRequest
-		if err := json.Unmarshal(rawBody, &responses); err == nil && responses.Input != nil {
-			return &fwkrh.InferenceRequestBody{Responses: &responses}, nil
+		var req struct {
+			fwkrh.ResponsesRequest
+			commonScalars
+			MaxOutput json.RawMessage `json:"max_output_tokens"`
 		}
-		return nil, errors.New("invalid responses request: must have input field")
+		if err := json.Unmarshal(rawBody, &req); err != nil || req.Input == nil {
+			return nil, errors.New("invalid responses request: must have input field")
+		}
+		responses := req.ResponsesRequest
+		return withScalars(&fwkrh.InferenceRequestBody{Responses: &responses}, req.commonScalars, maxOutputTokens(req.MaxOutput)), nil
 
 	case chatCompletionsAPI:
-		var chatCompletions fwkrh.ChatCompletionsRequest
-		if err := json.Unmarshal(rawBody, &chatCompletions); err == nil {
-			if err = validateChatCompletionsMessages(chatCompletions.Messages); err == nil {
-				return &fwkrh.InferenceRequestBody{ChatCompletions: &chatCompletions}, nil
-			}
+		var req struct {
+			fwkrh.ChatCompletionsRequest
+			commonScalars
+			MaxCompletion json.RawMessage `json:"max_completion_tokens"`
+			MaxTokens     json.RawMessage `json:"max_tokens"`
 		}
-		return nil, errors.New("invalid chat completions request: must have valid messages field")
+		if err := json.Unmarshal(rawBody, &req); err != nil || validateChatCompletionsMessages(req.Messages) != nil {
+			return nil, errors.New("invalid chat completions request: must have valid messages field")
+		}
+		chatCompletions := req.ChatCompletionsRequest
+		return withScalars(&fwkrh.InferenceRequestBody{ChatCompletions: &chatCompletions}, req.commonScalars, maxOutputTokens(req.MaxCompletion, req.MaxTokens)), nil
 
 	case completionsAPI:
-		var completions fwkrh.CompletionsRequest
-		if err := json.Unmarshal(rawBody, &completions); err == nil && !completions.Prompt.IsEmpty() {
-			return &fwkrh.InferenceRequestBody{Completions: &completions}, nil
+		var req struct {
+			fwkrh.CompletionsRequest
+			commonScalars
+			MaxTokens json.RawMessage `json:"max_tokens"`
 		}
-		return nil, errors.New("invalid completions request: must have prompt field")
+		if err := json.Unmarshal(rawBody, &req); err != nil || req.Prompt.IsEmpty() {
+			return nil, errors.New("invalid completions request: must have prompt field")
+		}
+		completions := req.CompletionsRequest
+		return withScalars(&fwkrh.InferenceRequestBody{Completions: &completions}, req.commonScalars, maxOutputTokens(req.MaxTokens)), nil
 
 	case embeddingsAPI:
-		var embeddings fwkrh.EmbeddingsRequest
-		if err := json.Unmarshal(rawBody, &embeddings); err == nil && !embeddings.Input.IsEmpty() {
-			return &fwkrh.InferenceRequestBody{Embeddings: &embeddings}, nil
+		var req struct {
+			fwkrh.EmbeddingsRequest
+			commonScalars
 		}
-		return nil, errors.New("invalid embeddings request: must have input field")
+		if err := json.Unmarshal(rawBody, &req); err != nil || req.Input.IsEmpty() {
+			return nil, errors.New("invalid embeddings request: must have input field")
+		}
+		embeddings := req.EmbeddingsRequest
+		return withScalars(&fwkrh.InferenceRequestBody{Embeddings: &embeddings}, req.commonScalars, nil), nil
 
 	case imagesGenerationsAPI:
-		var images fwkrh.ImagesGenerationsRequest
-		if err := json.Unmarshal(rawBody, &images); err == nil && images.Prompt != "" {
-			return &fwkrh.InferenceRequestBody{Images: &images}, nil
+		var req struct {
+			fwkrh.ImagesGenerationsRequest
+			commonScalars
 		}
-		return nil, errors.New("invalid images generations request: must have prompt field")
+		if err := json.Unmarshal(rawBody, &req); err != nil || req.Prompt == "" {
+			return nil, errors.New("invalid images generations request: must have prompt field")
+		}
+		images := req.ImagesGenerationsRequest
+		return withScalars(&fwkrh.InferenceRequestBody{Images: &images}, req.commonScalars, nil), nil
 	default:
 		return nil, errors.New("unsupported API endpoint")
 	}
+}
+
+// withScalars populates the derived model/stream/max-output fields on the body.
+func withScalars(b *fwkrh.InferenceRequestBody, s commonScalars, maxOut *int64) *fwkrh.InferenceRequestBody {
+	b.Model = s.model()
+	b.Stream = s.stream()
+	b.MaxOutputTokens = maxOut
+	return b
 }
 
 func validateChatCompletionsMessages(messages []fwkrh.Message) error {
