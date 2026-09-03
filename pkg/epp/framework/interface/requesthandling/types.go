@@ -87,6 +87,19 @@ func (RawPayload) isRequestPayload()         {}
 func (RawPayload) IsParsed() bool            { return false }
 func (RawPayload) AsMap() (PayloadMap, bool) { return nil, false }
 
+// RawJSONPayload is a JSON body kept as raw bytes but re-serializable, so it can
+// be forwarded and model-rewritten without decoding into a map. AsMap reports no
+// map, routing consumers that need structured fields to the typed body.
+type RawJSONPayload []byte
+
+func (RawJSONPayload) isRequestPayload() {}
+
+// IsParsed reports that a re-serializable typed body is available; it does not
+// imply AsMap returns a map (it does not).
+func (RawJSONPayload) IsParsed() bool             { return true }
+func (RawJSONPayload) AsMap() (PayloadMap, bool)  { return nil, false }
+func (p RawJSONPayload) Marshal() ([]byte, error) { return []byte(p), nil }
+
 // InferenceRequestBody contains the request-body fields that we parse out as user input,
 // to be used in forming scheduling decisions.
 // An InferenceRequestBody must contain exactly one of CompletionsRequest, ChatCompletionsRequest, ResponsesRequest, ConversationsRequest, EmbeddingsRequest, GenerateRequest,
@@ -140,16 +153,24 @@ type InferenceRequestBody struct {
 	Mutated bool
 }
 
-// MutatePayloadMap edits Payload in place via fn when Payload is a PayloadMap, and marks the
-// body Mutated in the same call so the two can't be separated by an omitted follow-up write.
-// No-op (Mutated left untouched) when Payload is not a PayloadMap.
+// MutatePayloadMap edits Payload as a map via fn and marks the body Mutated in
+// the same call so the two can't be separated by an omitted follow-up write. A
+// RawJSONPayload is decoded to a map first, so the decode happens only when a
+// caller actually mutates. No-op for any other payload type.
 func (b *InferenceRequestBody) MutatePayloadMap(fn func(PayloadMap)) {
-	m, ok := b.Payload.(PayloadMap)
-	if !ok {
-		return
+	switch p := b.Payload.(type) {
+	case PayloadMap:
+		fn(p)
+		b.Mutated = true
+	case RawJSONPayload:
+		var m PayloadMap
+		if err := json.Unmarshal(p, &m); err != nil {
+			return
+		}
+		fn(m)
+		b.Payload = m
+		b.Mutated = true
 	}
-	fn(m)
-	b.Mutated = true
 }
 
 // MaxOutputTokensFromPayload returns the client-requested output-token cap read
