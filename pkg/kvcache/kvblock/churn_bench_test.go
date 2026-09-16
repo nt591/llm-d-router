@@ -110,7 +110,8 @@ func benchmarkIndexChurn(b *testing.B, residentKeys int, profile churnProfile) {
 	}
 
 	addKeys := make([]kvblock.BlockHash, profile.addKeys)
-	nextKey := uint64(residentKeys) + 1
+	// residentKeys is positive, and every Go int value fits in uint64.
+	nextKey := uint64(residentKeys) + 1 // #nosec G115
 
 	runtime.GC()
 	runtime.GC()
@@ -167,9 +168,16 @@ func benchmarkIndexChurn(b *testing.B, residentKeys int, profile churnProfile) {
 	b.ReportMetric(float64(after.PauseTotalNs-before.PauseTotalNs)/events, "gc-pause-ns/event")
 	b.ReportMetric((gcCPUAfter-gcCPUBefore)*1e9/events, "gc-cpu-ns/event")
 	b.ReportMetric(float64(after.NumGC-before.NumGC)*1000/events, "gc-cycles/kevent")
-	b.ReportMetric(float64(int64(populated.HeapAlloc)-int64(empty.HeapAlloc))/float64(residentKeys), "resident-B/key")
-	b.ReportMetric(float64(int64(populated.HeapObjects)-int64(empty.HeapObjects))/float64(residentKeys), "resident-objects/key")
+	b.ReportMetric(metricDelta(populated.HeapAlloc, empty.HeapAlloc)/float64(residentKeys), "resident-B/key")
+	b.ReportMetric(metricDelta(populated.HeapObjects, empty.HeapObjects)/float64(residentKeys), "resident-objects/key")
 	b.ReportMetric(float64(forcedGC.Nanoseconds()), "forced-gc-ns")
+}
+
+func metricDelta(after, before uint64) float64 {
+	if after >= before {
+		return float64(after - before)
+	}
+	return -float64(before - after)
 }
 
 func churnResidentKeys(b *testing.B) int {

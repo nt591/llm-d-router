@@ -127,17 +127,6 @@ func newSlabStore(size, entryCap int, pods, tiers *interner) (*slabStore, error)
 	return s, nil
 }
 
-func runCapacities(limit int) []uint16 {
-	capacities := make([]uint16, 0, 17)
-	for capacity := uint32(1); capacity < uint32(limit); capacity *= 2 {
-		capacities = append(capacities, uint16(capacity))
-	}
-	if len(capacities) == 0 || capacities[len(capacities)-1] != uint16(limit) {
-		capacities = append(capacities, uint16(limit))
-	}
-	return capacities
-}
-
 func (s *slabStore) node(id uint32) *slabNode {
 	return &s.nodeChunks[id>>slabChunkBits][id&slabChunkMask]
 }
@@ -151,14 +140,17 @@ func (s *slabStore) refs(head uint32, capacity uint16) []slabRef {
 	return chunk[offset : offset+uint32(capacity)]
 }
 
-func (s *slabStore) allocNodeLocked(hash BlockHash) (uint32, *slabNode) {
+func (s *slabStore) allocNodeLocked(hash BlockHash) (uint32, *slabNode, error) {
 	var id uint32
 	if s.freeNodes != 0 {
 		id = s.freeNodes
 		n := s.node(id)
 		s.freeNodes = n.head
 	} else {
-		id = uint32(s.nextNode)
+		if s.nextNode > uint64(^uint32(0)) {
+			return 0, nil, errors.New("slab node capacity exhausted")
+		}
+		id = uint32(s.nextNode) // #nosec G115 -- bounds checked above.
 		s.nextNode++
 		chunkIdx := id >> slabChunkBits
 		if s.nodeChunks[chunkIdx] == nil {
@@ -177,7 +169,7 @@ func (s *slabStore) allocNodeLocked(hash BlockHash) (uint32, *slabNode) {
 	n.next = 0
 	n.version = s.nextVersion
 	n.mu.Unlock()
-	return id, n
+	return id, n, nil
 }
 
 func (s *slabStore) allocRun(capacity uint16) (uint32, error) {
@@ -319,9 +311,13 @@ func (s *slabStore) add(key BlockHash, records []slabRef) error {
 		if s.len == s.capacity {
 			s.releaseNodeLocked(s.tail)
 		}
-		id, n := s.allocNodeLocked(key)
+		id, n, err := s.allocNodeLocked(key)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
 		n.mu.Lock()
-		err := s.addAllLocked(n, records)
+		err = s.addAllLocked(n, records)
 		if err != nil {
 			s.freeRun(n.head, n.runCap)
 			n.hash = 0

@@ -40,6 +40,17 @@ func TestSlabRunAllocationAcrossChunkBoundaries(t *testing.T) {
 	}
 }
 
+func runCapacities(limit uint16) []uint16 {
+	capacities := make([]uint16, 0, 17)
+	for capacity := uint32(1); capacity < uint32(limit); capacity *= 2 {
+		capacities = append(capacities, uint16(capacity))
+	}
+	if len(capacities) == 0 || capacities[len(capacities)-1] != limit {
+		capacities = append(capacities, limit)
+	}
+	return capacities
+}
+
 func TestSlabRunReuse(t *testing.T) {
 	store, err := newSlabStore(1, 10, newInterner(maxInternedPods), newInterner(maxInternedTiers))
 	require.NoError(t, err)
@@ -58,6 +69,15 @@ func TestSlabReportsReferenceCapacityExhaustion(t *testing.T) {
 	store.nextChunk = uint32(len(store.refChunks))
 	_, err = store.allocRun(1)
 	require.ErrorContains(t, err, "slab reference capacity exhausted")
+}
+
+func TestSlabReportsNodeCapacityExhaustion(t *testing.T) {
+	store, err := newSlabStore(1, 1, newInterner(maxInternedPods), newInterner(maxInternedTiers))
+	require.NoError(t, err)
+	store.nextNode = uint64(^uint32(0)) + 1
+
+	err = store.add(1, nil)
+	require.ErrorContains(t, err, "slab node capacity exhausted")
 }
 
 func TestSlabAddPreservesEntriesOnReferenceExhaustion(t *testing.T) {
