@@ -268,6 +268,17 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	}
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Add")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	storeLocked := !m.data.hasWorstCaseAddCapacity(len(requestKeys))
+	if storeLocked {
+		m.data.mu.Lock()
+		defer m.data.mu.Unlock()
+		if err := m.data.ensureAddCapacityLocked(requestKeys, entries); err != nil {
+			return fmt.Errorf("failed to add request keys: %w", err)
+		}
+	}
 
 	// Intern once per call, before anything is written: a rejected batch
 	// leaves no mapping and no ordinal behind. The same records apply to
@@ -290,13 +301,14 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	}
 
 	// Store requestKey -> pod mappings for all request keys.
-	// Hold m.mu to prevent Evict from checking emptiness and removing the
-	// engine→request mapping while we are inserting pod entries.
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	for _, requestKey := range requestKeys {
-		if err := m.data.add(requestKey, records); err != nil {
+		var err error
+		if storeLocked {
+			err = m.data.addWithStoreLockHeld(requestKey, records)
+		} else {
+			err = m.data.add(requestKey, records)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to add request key: %w", err)
 		}
 

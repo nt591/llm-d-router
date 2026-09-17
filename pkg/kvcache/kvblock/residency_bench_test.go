@@ -160,7 +160,7 @@ func TestInMemoryIndexHeapProfile(t *testing.T) {
 	runtime.GC()
 
 	// The benchmark caller explicitly selects the output path.
-	f, err := os.Create(path) // #nosec G304
+	f, err := os.Create(path) // #nosec G304,G703 -- benchmark caller explicitly selects the output path.
 	if err != nil {
 		t.Fatal(err)
 	}

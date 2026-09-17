@@ -19,9 +19,11 @@ package kvcache_test
 import (
 	"fmt"
 	"os"
+	"runtime"
 	runtimemetrics "runtime/metrics"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,21 +100,40 @@ func benchmarkPreciseFirehose(b *testing.B, hotKeys int) {
 		writerInterval = time.Duration(float64(time.Second) / loopsPerSec)
 	}
 
+	start := make(chan struct{})
 	stop := make(chan struct{})
+	writerErrors := make(chan error, writers)
+	var admittedBlocks atomic.Uint64
+	var evictedBlocks atomic.Uint64
+	var clears atomic.Uint64
+	var ready sync.WaitGroup
 	var wg sync.WaitGroup
-	for w := 0; w < writers; w++ {
+	ready.Add(writers)
+	for w := uint64(0); w < writers; w++ {
 		wg.Add(1)
-		go func(w int) {
+		go func(w uint64) {
 			defer wg.Done()
 			pod := fmt.Sprintf("10.1.0.%d:8000", w)
 			entry := []kvblock.PodEntry{{PodIdentifier: pod, DeviceTier: "gpu"}}
 			cur := make([]kvblock.BlockHash, 64)
 			prev := make([]kvblock.BlockHash, 64)
 			havePrev := false
+			ready.Done()
+			select {
+			case <-start:
+			case <-stop:
+				return
+			}
 			var tick *time.Ticker
 			if writerInterval > 0 {
 				tick = time.NewTicker(writerInterval)
 				defer tick.Stop()
+			}
+			reportError := func(op string, err error) {
+				select {
+				case writerErrors <- fmt.Errorf("writer %d %s: %w", w, op, err):
+				default:
+				}
 			}
 			for i := uint64(0); ; i++ {
 				if tick != nil {
@@ -128,31 +149,60 @@ func benchmarkPreciseFirehose(b *testing.B, hotKeys int) {
 					default:
 					}
 				}
-				base := (uint64(w+1) << 40) | (i * 64)
+				base := ((w + 1) << 40) | (i * 64)
 				for j := range cur {
 					cur[j] = kvblock.BlockHash(base + uint64(j))
 				}
-				_ = idx.Add(ctx, cur, cur, entry)
+				if err := idx.Add(ctx, cur, cur, entry); err != nil {
+					reportError("add", err)
+					return
+				}
+				admittedBlocks.Add(uint64(len(cur)))
 				if havePrev {
 					for _, k := range prev {
-						_ = idx.Evict(ctx, k, kvblock.EngineKey, entry)
+						if err := idx.Evict(ctx, k, kvblock.EngineKey, entry); err != nil {
+							reportError("evict", err)
+							return
+						}
 					}
+					evictedBlocks.Add(uint64(len(prev)))
 				}
 				copy(prev, cur)
 				havePrev = true
 				if i%256 == 255 {
-					_ = idx.Clear(ctx, pod)
+					if err := idx.Clear(ctx, pod); err != nil {
+						reportError("clear", err)
+						return
+					}
+					clears.Add(1)
 					havePrev = false
 				}
 			}
 		}(w)
 	}
+	ready.Wait()
+	var stopOnce sync.Once
+	stopWriters := func() {
+		stopOnce.Do(func() { close(stop) })
+		wg.Wait()
+	}
+	defer stopWriters()
 
+	// Start from a completed collection so the GC pacer goal derives from the
+	// resident heap.
+	runtime.GC()
 	gcBefore := readFirehoseGCSeconds()
 	cyclesBefore := readFirehoseGCCycles()
-	b.ReportAllocs()
+	allocBytesBefore, allocObjectsBefore := readFirehoseAllocTotals()
 	b.ResetTimer()
+	measurementStart := time.Now()
+	close(start)
 	for i := 0; i < b.N; i++ {
+		select {
+		case err := <-writerErrors:
+			b.Fatal(err)
+		default:
+		}
 		matches, err := indexer.MatchBlockKeys(ctx, hot, nil)
 		if err != nil {
 			b.Fatal(err)
@@ -162,16 +212,33 @@ func benchmarkPreciseFirehose(b *testing.B, hotKeys int) {
 		}
 	}
 	b.StopTimer()
+	stopWriters()
+	measurementElapsed := time.Since(measurementStart).Seconds()
 	gcAfter := readFirehoseGCSeconds()
 	cyclesAfter := readFirehoseGCCycles()
-	close(stop)
-	wg.Wait()
+	allocBytesAfter, allocObjectsAfter := readFirehoseAllocTotals()
+	completedAdmitted := admittedBlocks.Load()
+	completedEvicted := evictedBlocks.Load()
+	completedClears := clears.Load()
+	select {
+	case err := <-writerErrors:
+		b.Fatal(err)
+	default:
+	}
 
-	b.ReportMetric((gcAfter-gcBefore)*1e9/float64(b.N), "gc-cpu-ns/op")
 	// gc-cycles shows how many collections ran. Trust gc-cpu only when it is high.
 	b.ReportMetric(float64(cyclesAfter-cyclesBefore), "gc-cycles")
-	if s := b.Elapsed().Seconds(); s > 0 {
-		b.ReportMetric((gcAfter-gcBefore)/s*100, "gc-cpu%")
+	if measurementElapsed > 0 {
+		b.ReportMetric((gcAfter-gcBefore)/measurementElapsed*100, "process-gc-cpu%")
+		admittedRate := float64(completedAdmitted) / measurementElapsed
+		b.ReportMetric(admittedRate, "admitted-blocks/s")
+		b.ReportMetric(float64(completedEvicted)/measurementElapsed, "evicted-blocks/s")
+		b.ReportMetric(float64(completedClears)/measurementElapsed, "clears/s")
+		b.ReportMetric(float64(allocBytesAfter-allocBytesBefore)/measurementElapsed, "process-heap-alloc-B/s")
+		b.ReportMetric(float64(allocObjectsAfter-allocObjectsBefore)/measurementElapsed, "process-heap-allocs/s")
+		if writeRate > 0 {
+			b.ReportMetric(admittedRate/float64(writeRate), "achieved/offered")
+		}
 	}
 	if writeRate > 0 {
 		b.ReportMetric(float64(writeRate), "offered-adm/s")
@@ -216,4 +283,13 @@ func readFirehoseGCCycles() uint64 {
 	samples := []runtimemetrics.Sample{{Name: "/gc/cycles/total:gc-cycles"}}
 	runtimemetrics.Read(samples)
 	return samples[0].Value.Uint64()
+}
+
+func readFirehoseAllocTotals() (bytes, objects uint64) {
+	samples := []runtimemetrics.Sample{
+		{Name: "/gc/heap/allocs:bytes"},
+		{Name: "/gc/heap/allocs:objects"},
+	}
+	runtimemetrics.Read(samples)
+	return samples[0].Value.Uint64(), samples[1].Value.Uint64()
 }

@@ -76,6 +76,9 @@ type runBump struct {
 
 // slabStore keeps key metadata and compact entry records in stable chunks.
 // Node and entry addresses remain valid while concurrent readers finish.
+// Entry runs use exact-capacity size classes and grow without shrinking. Freed
+// runs remain in their class for reuse, and chunks remain allocated for the
+// store lifetime, so resident memory reflects peak demand across size classes.
 type slabStore struct {
 	mu       sync.RWMutex
 	refsMu   sync.Mutex
@@ -181,7 +184,10 @@ func (s *slabStore) allocNodeLocked(hash BlockHash) (nodeID, *slabNode, error) {
 func (s *slabStore) allocRun(capacity uint16) (runHead, error) {
 	s.refsMu.Lock()
 	defer s.refsMu.Unlock()
+	return s.allocRunLocked(capacity)
+}
 
+func (s *slabStore) allocRunLocked(capacity uint16) (runHead, error) {
 	if head := s.freeRuns[capacity]; head != 0 {
 		s.freeRuns[capacity] = runHead(s.refs(head, capacity)[0].PodOrdinal)
 		return head, nil
@@ -217,28 +223,172 @@ func (s *slabStore) freeRun(head runHead, capacity uint16) {
 	s.freeRuns[capacity] = head
 }
 
-func (s *slabStore) growRun(n *slabNode) error {
-	newCap := uint32(1)
-	if n.runCap > 0 {
-		newCap = uint32(n.runCap) * 2
-	}
-	if newCap > uint32(s.entryCap) {
-		newCap = uint32(s.entryCap)
+// hasWorstCaseAddCapacity handles the ordinary case without taking allocator
+// locks. InMemoryIndex serializes Add calls, and other operations only return
+// runs to the allocator.
+func (s *slabStore) hasWorstCaseAddCapacity(keys int) bool {
+	if keys <= 0 {
+		return true
 	}
 
-	newHead, err := s.allocRun(uint16(newCap))
+	classes := 0
+	for capacity := uint32(1); ; {
+		classes++
+		if capacity >= uint32(s.entryCap) {
+			break
+		}
+		capacity = min(capacity*2, uint32(s.entryCap))
+	}
+	remainingChunks := uint64(len(s.refChunks)) - uint64(s.nextChunk)
+	keyCount := uint64(keys)
+	return keyCount <= remainingChunks/uint64(classes)
+}
+
+// ensureAddCapacityLocked checks the exact size-class growth required by a
+// batch. The caller holds s.mu until the batch has finished adding records.
+func (s *slabStore) ensureAddCapacityLocked(keys []BlockHash, entries []PodEntry) error {
+	neededRuns := make([]uint64, len(s.runBumps))
+	incomingLen := 0
+	for i, entry := range entries {
+		duplicate := false
+		for j := 0; j < i; j++ {
+			if entries[j] == entry {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate && incomingLen < int(s.entryCap) {
+			incomingLen++
+		}
+	}
+	incomingCap := s.runCapacity(incomingLen)
+	allPresentWithoutGrowth := true
+	for _, key := range keys {
+		currentLen := 0
+		currentCap := uint16(0)
+		var refs []slabRef
+		var n *slabNode
+		_, present := s.items[key]
+		if present {
+			id := s.items[key]
+			n = s.node(id)
+			n.mu.Lock()
+			currentLen = int(n.runLen)
+			currentCap = n.runCap
+			refs = s.refs(n.head, n.runCap)[:n.runLen]
+		}
+
+		required := currentLen
+		for i, entry := range entries {
+			found := false
+			for _, ref := range refs {
+				if ref.entry(s.pods, s.tiers).PodEntry == entry {
+					found = true
+					break
+				}
+			}
+			if !found {
+				for j := 0; j < i; j++ {
+					if entries[j] == entry {
+						found = true
+						break
+					}
+				}
+			}
+			if !found && required < int(s.entryCap) {
+				required++
+			}
+		}
+		if n != nil {
+			n.mu.Unlock()
+		}
+
+		if currentCap < uint16(required) {
+			allPresentWithoutGrowth = false
+			growthCap := s.runCapacity(required)
+			if growthCap != incomingCap {
+				neededRuns[growthCap]++
+			}
+		}
+		if !present {
+			allPresentWithoutGrowth = false
+		}
+		neededRuns[incomingCap]++
+	}
+	if allPresentWithoutGrowth {
+		return nil
+	}
+
+	s.refsMu.Lock()
+	defer s.refsMu.Unlock()
+
+	remainingChunks := uint64(len(s.refChunks)) - uint64(s.nextChunk)
+	requiredChunks := uint64(0)
+	for capacity := uint32(1); ; {
+		needed := neededRuns[capacity]
+		for head := s.freeRuns[capacity]; head != 0 && needed > 0; needed-- {
+			head = runHead(s.refs(head, uint16(capacity))[0].PodOrdinal)
+		}
+		bump := s.runBumps[capacity]
+		if needed > 0 && bump.initialized {
+			available := uint64((slabChunkSize - bump.offset) / capacity)
+			if available >= needed {
+				needed = 0
+			} else {
+				needed -= available
+			}
+		}
+		if needed > 0 {
+			runsPerChunk := uint64(slabChunkSize / capacity)
+			chunks := (needed + runsPerChunk - 1) / runsPerChunk
+			if chunks > remainingChunks-requiredChunks {
+				return errors.New("slab reference capacity exhausted")
+			}
+			requiredChunks += chunks
+		}
+		if requiredChunks > remainingChunks {
+			return errors.New("slab reference capacity exhausted")
+		}
+		if capacity >= uint32(s.entryCap) {
+			break
+		}
+		capacity = min(capacity*2, uint32(s.entryCap))
+	}
+	// The first allocation can lose one run because address zero is the
+	// free-list sentinel. One additional chunk covers that loss regardless of
+	// which size class is allocated first.
+	if s.nextChunk == 0 && requiredChunks > 0 {
+		if requiredChunks == remainingChunks {
+			return errors.New("slab reference capacity exhausted")
+		}
+	}
+	return nil
+}
+
+func (s *slabStore) growRun(n *slabNode, newCap uint16) error {
+	newHead, err := s.allocRun(newCap)
 	if err != nil {
 		return err
 	}
-	newRefs := s.refs(newHead, uint16(newCap))
+	newRefs := s.refs(newHead, newCap)
+	oldHead, oldCap := n.head, n.runCap
 	if n.runLen > 0 {
-		oldHead, oldCap := n.head, n.runCap
 		copy(newRefs, s.refs(oldHead, oldCap)[:n.runLen])
+	}
+	if oldCap > 0 {
 		s.freeRun(oldHead, oldCap)
 	}
 	n.head = newHead
-	n.runCap = uint16(newCap)
+	n.runCap = newCap
 	return nil
+}
+
+func (s *slabStore) runCapacity(required int) uint16 {
+	capacity := uint32(1)
+	for capacity < uint32(required) {
+		capacity = min(capacity*2, uint32(s.entryCap))
+	}
+	return uint16(capacity)
 }
 
 func (s *slabStore) addAllLocked(n *slabNode, records []slabRef) error {
@@ -264,8 +414,8 @@ func (s *slabStore) addAllLocked(n *slabNode, records []slabRef) error {
 			required++
 		}
 	}
-	for int(n.runCap) < required {
-		if err := s.growRun(n); err != nil {
+	if int(n.runCap) < required {
+		if err := s.growRun(n, s.runCapacity(required)); err != nil {
 			return err
 		}
 	}
@@ -314,35 +464,47 @@ func (s *slabStore) add(key BlockHash, records []slabRef) error {
 			return err
 		}
 
-		if s.len == s.capacity {
-			s.releaseNodeLocked(s.tail)
-		}
-		id, n, err := s.allocNodeLocked(key)
-		if err != nil {
-			s.mu.Unlock()
-			return err
-		}
-		n.mu.Lock()
-		err = s.addAllLocked(n, records)
-		if err != nil {
-			s.freeRun(n.head, n.runCap)
-			n.hash = 0
-			n.head = 0
-			n.runLen = 0
-			n.runCap = 0
-			n.next = s.freeNodeHead
-			s.freeNodeHead = id
-			n.mu.Unlock()
-			s.mu.Unlock()
-			return err
-		}
-		n.mu.Unlock()
-		s.items[key] = id
-		s.insertHeadLocked(id, n)
-		s.len++
+		err := s.addNewWithStoreLockHeld(key, records)
 		s.mu.Unlock()
-		return nil
+		return err
 	}
+}
+
+func (s *slabStore) addWithStoreLockHeld(key BlockHash, records []slabRef) error {
+	if id, found := s.items[key]; found {
+		n := s.node(id)
+		s.moveToHeadLocked(id, n)
+		n.mu.Lock()
+		err := s.addAllLocked(n, records)
+		n.mu.Unlock()
+		return err
+	}
+	return s.addNewWithStoreLockHeld(key, records)
+}
+
+func (s *slabStore) addNewWithStoreLockHeld(key BlockHash, records []slabRef) error {
+	var staged slabNode
+	if err := s.addAllLocked(&staged, records); err != nil {
+		s.freeRun(staged.head, staged.runCap)
+		return err
+	}
+	if s.len == s.capacity {
+		s.releaseNodeLocked(s.tail)
+	}
+	id, n, err := s.allocNodeLocked(key)
+	if err != nil {
+		s.freeRun(staged.head, staged.runCap)
+		return err
+	}
+	n.mu.Lock()
+	n.head = staged.head
+	n.runLen = staged.runLen
+	n.runCap = staged.runCap
+	n.mu.Unlock()
+	s.items[key] = id
+	s.insertHeadLocked(id, n)
+	s.len++
+	return nil
 }
 
 func (s *slabStore) capture(key BlockHash, promote bool) (*slabNode, uint64, bool) {
