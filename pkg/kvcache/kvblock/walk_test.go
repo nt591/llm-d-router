@@ -78,6 +78,48 @@ func TestWalkKeysVisitsEveryPositionInOrder(t *testing.T) {
 	assert.Equal(t, []PodEntry{podA, podB}, podEntries(visits[2].entries))
 }
 
+func TestCompactWalkMatchesWalk(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	index, err := NewInMemoryIndex(nil)
+	require.NoError(t, err)
+	entries := []PodEntry{
+		{PodIdentifier: "pod-a", DeviceTier: "gpu", HasGroup: true, GroupIdx: -1},
+		{PodIdentifier: "pod-b", DeviceTier: "cpu", Speculative: true},
+	}
+	keys := []BlockHash{10, 20}
+	require.NoError(t, index.Add(ctx, nil, keys[:1], entries))
+
+	compact := make([]visit, 0, len(keys))
+	err = index.WalkCompactKeys(ctx, keys, func(pos int, found bool, refs []CompactEntryRef) bool {
+		var decoded []EntryRef
+		if len(refs) > 0 {
+			decoded = make([]EntryRef, len(refs))
+		}
+		for i, ref := range refs {
+			decoded[i] = EntryRef{
+				PodEntry: PodEntry{
+					PodIdentifier: index.PodName(ref.PodOrdinal),
+					DeviceTier:    index.TierName(ref.TierOrdinal()),
+					Speculative:   ref.Speculative(),
+					HasGroup:      ref.HasGroup(),
+					GroupIdx:      ref.GroupIdx(),
+				},
+				PodOrdinal:  ref.PodOrdinal,
+				TierOrdinal: ref.TierOrdinal(),
+			}
+		}
+		compact = append(compact, visit{pos: pos, found: found, entries: decoded})
+		return true
+	})
+	require.NoError(t, err)
+	assert.Equal(t, walkAll(t, index, keys), compact)
+}
+
+func TestNewCompactEntryRefRejectsFlagBitsInTierOrdinal(t *testing.T) {
+	_, err := NewCompactEntryRef(1, 1<<12, false, false, 0)
+	require.ErrorContains(t, err, "tier ordinal must be at most")
+}
+
 // A key listed twice is visited at both positions.
 func TestWalkKeysVisitsDuplicatePositions(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
@@ -327,6 +369,8 @@ func TestWalkCapabilityThroughDecorators(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			walker, ok := wrapped.(KeyWalker)
 			require.True(t, ok, "decorators must keep the walk capability")
+			_, ok = wrapped.(CompactKeyWalker)
+			require.True(t, ok, "decorators must keep the compact walk capability")
 			assert.Equal(t, direct, walkAll(t, walker, keys))
 		})
 	}
@@ -342,9 +386,9 @@ func TestWalkCapabilityThroughDecorators(t *testing.T) {
 	}
 }
 
-// Concurrent walks and writes on one index must each see complete per-key
-// entries.
-func TestWalkKeysConcurrentReadersAndWriters(t *testing.T) {
+// Concurrent compact and materialized walks must each see complete per-key
+// entries while Add, Evict, and Clear update those keys.
+func TestWalkersConcurrentReadersAndWriters(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
 	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1 << 12, PodCacheSize: 16})
 	require.NoError(t, err)
@@ -359,36 +403,105 @@ func TestWalkKeysConcurrentReadersAndWriters(t *testing.T) {
 		entries[p] = PodEntry{PodIdentifier: fmt.Sprintf("pod-%d", p), DeviceTier: "gpu"}
 	}
 	require.NoError(t, index.Add(ctx, nil, keys, entries))
+	transient := []PodEntry{
+		{PodIdentifier: "pod-evicted", DeviceTier: "gpu"},
+		{PodIdentifier: "pod-cleared", DeviceTier: "gpu"},
+	}
+	allowed := make(map[string]struct{}, len(entries)+len(transient))
+	for _, entry := range entries {
+		allowed[entry.PodIdentifier] = struct{}{}
+	}
+	for _, entry := range transient {
+		allowed[entry.PodIdentifier] = struct{}{}
+	}
+	validate := func(pos int, found bool, pods []string) error {
+		if !found {
+			return fmt.Errorf("position %d: key not found", pos)
+		}
+		seen := make(map[string]struct{}, len(pods))
+		for _, pod := range pods {
+			if _, ok := allowed[pod]; !ok {
+				return fmt.Errorf("position %d: unexpected pod %q", pos, pod)
+			}
+			if _, duplicate := seen[pod]; duplicate {
+				return fmt.Errorf("position %d: duplicate pod %q", pos, pod)
+			}
+			seen[pod] = struct{}{}
+		}
+		for _, entry := range entries {
+			if _, ok := seen[entry.PodIdentifier]; !ok {
+				return fmt.Errorf("position %d: stable pod %q missing", pos, entry.PodIdentifier)
+			}
+		}
+		return nil
+	}
 
 	stop := make(chan struct{})
 	writerDone := make(chan struct{})
+	writerErr := make(chan error, 1)
 	go func() {
 		defer close(writerDone)
-		for i := 0; ; i++ {
+		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			_ = index.Add(ctx, nil, keys, entries) // refreshes recency only
-			churn := fmt.Sprintf("10.9.0.%d:8000", i%256)
-			_ = index.Add(ctx, nil, []BlockHash{1 << 40}, []PodEntry{{PodIdentifier: churn, DeviceTier: "gpu"}})
-			_ = index.Clear(ctx, churn)
+			if err := index.Add(ctx, nil, keys, transient); err != nil {
+				writerErr <- err
+				return
+			}
+			for _, key := range keys {
+				if err := index.Evict(ctx, key, RequestKey, transient[:1]); err != nil {
+					writerErr <- err
+					return
+				}
+			}
+			if err := index.Clear(ctx, transient[1].PodIdentifier); err != nil {
+				writerErr <- err
+				return
+			}
 		}
 	}()
 
 	const readers, iterations = 8, 40
-	errCh := make(chan error, readers)
+	errCh := make(chan error, readers*2)
 	var wg sync.WaitGroup
 	for r := 0; r < readers; r++ {
-		wg.Add(1)
+		wg.Add(2)
 		go func() {
 			defer wg.Done()
 			for range iterations {
 				var visitErr error
-				err := index.WalkKeys(ctx, keys, func(pos int, found bool, entries []EntryRef) bool {
-					if !found || len(entries) != numPods {
-						visitErr = fmt.Errorf("position %d: found=%v entries=%d, want %d", pos, found, len(entries), numPods)
+				err := index.WalkKeys(ctx, keys, func(pos int, found bool, refs []EntryRef) bool {
+					pods := make([]string, len(refs))
+					for i := range refs {
+						pods[i] = refs[i].PodIdentifier
+					}
+					if visitErr = validate(pos, found, pods); visitErr != nil {
+						return false
+					}
+					return true
+				})
+				if err == nil {
+					err = visitErr
+				}
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				var visitErr error
+				err := index.WalkCompactKeys(ctx, keys, func(pos int, found bool, refs []CompactEntryRef) bool {
+					pods := make([]string, len(refs))
+					for i := range refs {
+						pods[i] = index.PodName(refs[i].PodOrdinal)
+					}
+					if visitErr = validate(pos, found, pods); visitErr != nil {
 						return false
 					}
 					return true
@@ -406,6 +519,11 @@ func TestWalkKeysConcurrentReadersAndWriters(t *testing.T) {
 	wg.Wait()
 	close(stop)
 	<-writerDone
+	select {
+	case err := <-writerErr:
+		t.Error(err)
+	default:
+	}
 	close(errCh)
 	for err := range errCh {
 		t.Error(err)
