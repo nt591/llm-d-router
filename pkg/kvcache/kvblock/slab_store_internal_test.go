@@ -28,7 +28,7 @@ func TestSlabRunAllocationAcrossChunkBoundaries(t *testing.T) {
 	store, err := newSlabStore(size, entryCap, newInterner(maxInternedPods), newInterner(maxInternedTiers))
 	require.NoError(t, err)
 
-	heads := make(map[uint32]struct{})
+	heads := make(map[runHead]struct{})
 	for _, capacity := range runCapacities(entryCap) {
 		for range size {
 			head, err := store.allocRun(capacity)

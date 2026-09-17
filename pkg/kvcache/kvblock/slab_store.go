@@ -34,6 +34,10 @@ const (
 
 type slabRef = CompactEntryRef
 
+type nodeID uint32
+
+type runHead uint32
+
 func newSlabRef(entry PodEntry, pod, tier uint32) slabRef {
 	return newCompactEntryRef(pod, tier, entry.Speculative, entry.HasGroup, entry.GroupIdx)
 }
@@ -55,11 +59,11 @@ func (r slabRef) entry(pods, tiers *interner) EntryRef {
 
 type slabNode struct {
 	hash    BlockHash
-	head    uint32
+	head    runHead
 	runLen  uint16
 	runCap  uint16
-	prev    uint32
-	next    uint32
+	prev    nodeID
+	next    nodeID
 	version uint64
 	mu      sync.Mutex
 }
@@ -77,20 +81,20 @@ type slabStore struct {
 	refsMu   sync.Mutex
 	capacity int
 	entryCap uint16
-	items    map[BlockHash]uint32
+	items    map[BlockHash]nodeID
 	len      int
-	head     uint32
-	tail     uint32
+	head     nodeID
+	tail     nodeID
 
-	nodeChunks  []*[slabChunkSize]slabNode
-	nextNode    uint64
-	nextVersion uint64
-	freeNodes   uint32
+	nodeChunks   []*[slabChunkSize]slabNode
+	nextNode     uint64
+	nextVersion  uint64
+	freeNodeHead nodeID
 
 	refChunks []*[slabChunkSize]slabRef
 	nextChunk uint32
 	runBumps  []runBump
-	freeRuns  []uint32
+	freeRuns  []runHead
 
 	pods        *interner
 	tiers       *interner
@@ -111,12 +115,12 @@ func newSlabStore(size, entryCap int, pods, tiers *interner) (*slabStore, error)
 	s := &slabStore{
 		capacity:   size,
 		entryCap:   uint16(entryCap),
-		items:      make(map[BlockHash]uint32),
+		items:      make(map[BlockHash]nodeID),
 		nodeChunks: make([]*[slabChunkSize]slabNode, int(nodeChunkCount)),
 		nextNode:   1,
 		refChunks:  make([]*[slabChunkSize]slabRef, maxRefChunks),
 		runBumps:   make([]runBump, entryCap+1),
-		freeRuns:   make([]uint32, entryCap+1),
+		freeRuns:   make([]runHead, entryCap+1),
 		pods:       pods,
 		tiers:      tiers,
 	}
@@ -127,32 +131,34 @@ func newSlabStore(size, entryCap int, pods, tiers *interner) (*slabStore, error)
 	return s, nil
 }
 
-func (s *slabStore) node(id uint32) *slabNode {
-	return &s.nodeChunks[id>>slabChunkBits][id&slabChunkMask]
+func (s *slabStore) node(id nodeID) *slabNode {
+	raw := uint32(id)
+	return &s.nodeChunks[raw>>slabChunkBits][raw&slabChunkMask]
 }
 
-func (s *slabStore) refs(head uint32, capacity uint16) []slabRef {
+func (s *slabStore) refs(head runHead, capacity uint16) []slabRef {
 	if capacity == 0 {
 		return nil
 	}
-	chunk := s.refChunks[head>>slabChunkBits]
-	offset := head & slabChunkMask
+	raw := uint32(head)
+	chunk := s.refChunks[raw>>slabChunkBits]
+	offset := raw & slabChunkMask
 	return chunk[offset : offset+uint32(capacity)]
 }
 
-func (s *slabStore) allocNodeLocked(hash BlockHash) (uint32, *slabNode, error) {
-	var id uint32
-	if s.freeNodes != 0 {
-		id = s.freeNodes
+func (s *slabStore) allocNodeLocked(hash BlockHash) (nodeID, *slabNode, error) {
+	var id nodeID
+	if s.freeNodeHead != 0 {
+		id = s.freeNodeHead
 		n := s.node(id)
-		s.freeNodes = n.head
+		s.freeNodeHead = n.next
 	} else {
 		if s.nextNode > uint64(^uint32(0)) {
 			return 0, nil, errors.New("slab node capacity exhausted")
 		}
-		id = uint32(s.nextNode) // #nosec G115 -- bounds checked above.
+		id = nodeID(s.nextNode) // #nosec G115 -- bounds checked above.
 		s.nextNode++
-		chunkIdx := id >> slabChunkBits
+		chunkIdx := uint32(id) >> slabChunkBits
 		if s.nodeChunks[chunkIdx] == nil {
 			s.nodeChunks[chunkIdx] = new([slabChunkSize]slabNode)
 		}
@@ -172,12 +178,12 @@ func (s *slabStore) allocNodeLocked(hash BlockHash) (uint32, *slabNode, error) {
 	return id, n, nil
 }
 
-func (s *slabStore) allocRun(capacity uint16) (uint32, error) {
+func (s *slabStore) allocRun(capacity uint16) (runHead, error) {
 	s.refsMu.Lock()
 	defer s.refsMu.Unlock()
 
 	if head := s.freeRuns[capacity]; head != 0 {
-		s.freeRuns[capacity] = s.refs(head, capacity)[0].PodOrdinal
+		s.freeRuns[capacity] = runHead(s.refs(head, capacity)[0].PodOrdinal)
 		return head, nil
 	}
 
@@ -195,19 +201,19 @@ func (s *slabStore) allocRun(capacity uint16) (uint32, error) {
 			bump.offset = 1
 		}
 	}
-	head := bump.chunk<<slabChunkBits | bump.offset
+	head := runHead(bump.chunk<<slabChunkBits | bump.offset)
 	bump.offset += uint32(capacity)
 	return head, nil
 }
 
-func (s *slabStore) freeRun(head uint32, capacity uint16) {
+func (s *slabStore) freeRun(head runHead, capacity uint16) {
 	if capacity == 0 {
 		return
 	}
 	s.refsMu.Lock()
 	defer s.refsMu.Unlock()
 	refs := s.refs(head, capacity)
-	refs[0].PodOrdinal = s.freeRuns[capacity]
+	refs[0].PodOrdinal = uint32(s.freeRuns[capacity])
 	s.freeRuns[capacity] = head
 }
 
@@ -321,10 +327,11 @@ func (s *slabStore) add(key BlockHash, records []slabRef) error {
 		if err != nil {
 			s.freeRun(n.head, n.runCap)
 			n.hash = 0
+			n.head = 0
 			n.runLen = 0
 			n.runCap = 0
-			n.head = s.freeNodes
-			s.freeNodes = id
+			n.next = s.freeNodeHead
+			s.freeNodeHead = id
 			n.mu.Unlock()
 			s.mu.Unlock()
 			return err
@@ -501,7 +508,7 @@ func (s *slabStore) clearPod(pod uint32) {
 	s.mu.RUnlock()
 
 	for id64 := uint64(1); id64 < nextNode; id64++ {
-		id := uint32(id64)
+		id := nodeID(id64) // #nosec G115 -- nextNode never exceeds the uint32 address space.
 		n := s.node(id)
 		n.mu.Lock()
 		if n.runCap == 0 || n.version > maxVersion {
@@ -536,28 +543,28 @@ func (s *slabStore) clearPod(pod uint32) {
 	}
 }
 
-func (s *slabStore) releaseNodeLocked(id uint32) {
+func (s *slabStore) releaseNodeLocked(id nodeID) {
 	n := s.node(id)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	s.releaseNodeWithLockHeld(id, n)
 }
 
-func (s *slabStore) releaseNodeWithLockHeld(id uint32, n *slabNode) {
+func (s *slabStore) releaseNodeWithLockHeld(id nodeID, n *slabNode) {
 	delete(s.items, n.hash)
 	s.unlinkLocked(n)
 	s.len--
 	s.freeRun(n.head, n.runCap)
 	n.hash = 0
+	n.head = 0
 	n.runLen = 0
 	n.runCap = 0
 	n.prev = 0
-	n.next = 0
-	n.head = s.freeNodes
-	s.freeNodes = id
+	n.next = s.freeNodeHead
+	s.freeNodeHead = id
 }
 
-func (s *slabStore) insertHeadLocked(id uint32, n *slabNode) {
+func (s *slabStore) insertHeadLocked(id nodeID, n *slabNode) {
 	n.prev = 0
 	n.next = s.head
 	if s.head != 0 {
@@ -568,7 +575,7 @@ func (s *slabStore) insertHeadLocked(id uint32, n *slabNode) {
 	s.head = id
 }
 
-func (s *slabStore) moveToHeadLocked(id uint32, n *slabNode) {
+func (s *slabStore) moveToHeadLocked(id nodeID, n *slabNode) {
 	if s.head == id {
 		return
 	}
