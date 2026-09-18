@@ -48,6 +48,11 @@ type fakeSyncer struct {
 	deletes []setCall
 }
 
+type fakeLocalOverlaySyncer struct {
+	fakeSyncer
+	remote any
+}
+
 func (s *fakeSyncer) TypedName() fwkplugin.TypedName {
 	return fwkplugin.TypedName{Type: "fake-syncer", Name: "fake-syncer"}
 }
@@ -74,11 +79,17 @@ func (s *fakeSyncer) GetOrSet(_ context.Context, _ fwkdl.StateKey, _ string, can
 	return candidate, false, nil
 }
 
+func (s *fakeLocalOverlaySyncer) GetWithLocal(_ context.Context, _ fwkdl.StateKey, _ string, local any, aggregate func([]any) any) (any, bool, error) {
+	return aggregate([]any{s.remote, local}), true, nil
+}
+
 // fakeContributor is a Plugin + CrossReplicaContributor whose supplied value
 // echoes the endpoint ID, so tests can assert routing to the right key.
 type fakeContributor struct {
 	key          fwkdl.StateKey
 	syncDisabled bool
+	supply       func(string) func() fwkdl.Cloneable
+	aggregate    func([]any) any
 }
 
 type fakeEndpointContributor struct {
@@ -190,13 +201,21 @@ func (c fakeContributor) TypedName() fwkplugin.TypedName {
 }
 
 func (c fakeContributor) CrossReplicaState() fwkdl.CrossReplicaSpec {
+	supply := c.supply
+	if supply == nil {
+		supply = func(id string) func() fwkdl.Cloneable {
+			return func() fwkdl.Cloneable { return fakeCloneable{id: id} }
+		}
+	}
+	aggregate := c.aggregate
+	if aggregate == nil {
+		aggregate = func(values []any) any { return len(values) }
+	}
 	return fwkdl.CrossReplicaSpec{
 		StateKey:     c.key,
 		SyncDisabled: c.syncDisabled,
-		Supply: func(id string) func() fwkdl.Cloneable {
-			return func() fwkdl.Cloneable { return fakeCloneable{id: id} }
-		},
-		Aggregate: func(values []any) any { return len(values) },
+		Supply:       supply,
+		Aggregate:    aggregate,
 	}
 }
 
@@ -230,6 +249,37 @@ func TestCrossReplicaPublisher_PublishesForEndpoint(t *testing.T) {
 	assert.Equal(t, "ns/ep-a", syncer.sets[0].endpointID)
 	assert.Equal(t, fakeCloneable{id: "ns/ep-a"}, syncer.sets[0].value)
 	assert.Equal(t, 2, syncer.sets[0].aggregate([]any{"a", "b"}))
+}
+
+func TestCrossReplicaPublisher_ReadsLiveLocalStateBetweenPublishes(t *testing.T) {
+	local := fakeCloneable{id: "local-before"}
+	contributor := fakeContributor{
+		key: "inflight:test",
+		supply: func(string) func() fwkdl.Cloneable {
+			return func() fwkdl.Cloneable { return local }
+		},
+		aggregate: func(values []any) any {
+			result := make([]fakeCloneable, 0, len(values))
+			for _, value := range values {
+				result = append(result, value.(fakeCloneable))
+			}
+			return result
+		},
+	}
+	pub := &crossReplicaPublisher{
+		syncer: &fakeLocalOverlaySyncer{remote: fakeCloneable{id: "remote"}},
+	}
+
+	got, ok, err := pub.get(context.Background(), contributor.CrossReplicaState(), "ns/ep-a")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, []fakeCloneable{{id: "remote"}, {id: "local-before"}}, got)
+
+	local = fakeCloneable{id: "local-after"}
+	got, ok, err = pub.get(context.Background(), contributor.CrossReplicaState(), "ns/ep-a")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, []fakeCloneable{{id: "remote"}, {id: "local-after"}}, got)
 }
 
 func TestCrossReplicaPublisher_SkipsSyncDisabled(t *testing.T) {

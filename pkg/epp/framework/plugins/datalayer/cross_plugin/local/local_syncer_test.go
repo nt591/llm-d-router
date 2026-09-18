@@ -43,6 +43,17 @@ func TestLocalSyncerAggregatesOnSet(t *testing.T) {
 	assert.Equal(t, 1, aggregateCalls)
 }
 
+func TestLocalSyncerGetWithLocal(t *testing.T) {
+	syncer := NewLocalSyncer("test", "replica-a")
+	aggregate := func(values []any) any { return values[0] }
+	require.NoError(t, syncer.Set(context.Background(), "load", "default/backend-0", 3, aggregate))
+
+	value, ok, err := syncer.GetWithLocal(context.Background(), "load", "default/backend-0", 8, aggregate)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, 8, value)
+}
+
 func TestLocalSyncerGetOrSet(t *testing.T) {
 	syncer := NewLocalSyncer("test", "replica-a")
 

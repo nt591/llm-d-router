@@ -71,6 +71,10 @@ func (s *LocalSyncer) Get(_ context.Context, key fwkdl.StateKey, endpointID stri
 	return value, ok, nil
 }
 
+func (s *LocalSyncer) GetWithLocal(_ context.Context, _ fwkdl.StateKey, _ string, local any, aggregate func([]any) any) (any, bool, error) {
+	return aggregate([]any{local}), true, nil
+}
+
 func (s *LocalSyncer) Delete(_ context.Context, key fwkdl.StateKey, endpointID string) error {
 	s.data.Delete(s.syncKey(key, endpointID))
 	return nil

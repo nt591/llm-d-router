@@ -52,6 +52,11 @@ type crossReplicaPublisher struct {
 	endpoints sets.Set[types.NamespacedName]
 }
 
+type localOverlaySyncer interface {
+	fwkdl.CrossReplicaSyncer
+	GetWithLocal(ctx context.Context, key fwkdl.StateKey, endpointID string, local any, aggregate func([]any) any) (any, bool, error)
+}
+
 // newCrossReplicaPublisher collects the opted-in CrossReplicaContributors, or
 // returns nil if there is no syncer or none opt in. Non-positive durations
 // fall back to their defaults.
@@ -168,6 +173,9 @@ func (p *crossReplicaPublisher) set(ctx context.Context, spec fwkdl.CrossReplica
 func (p *crossReplicaPublisher) get(ctx context.Context, spec fwkdl.CrossReplicaSpec, endpointID string) (any, bool, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if syncer, ok := p.syncer.(localOverlaySyncer); ok {
+		return syncer.GetWithLocal(ctx, spec.StateKey, endpointID, spec.Supply(endpointID)(), spec.Aggregate)
+	}
 	return p.syncer.Get(ctx, spec.StateKey, endpointID)
 }
 
