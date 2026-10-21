@@ -30,3 +30,10 @@ type QueueInspectionMethods interface {
 	// Returns nil if the queue is empty.
 	Peek() QueueItemAccessor
 }
+
+// MatchingQueue can select eligible work without removing blocked requests.
+// The returned item must be first under the queue's ordering policy among matches.
+// The predicate must not mutate the queue or block.
+type MatchingQueue interface {
+	PeekMatching(predicate func(QueueItemAccessor) bool) QueueItemAccessor
+}

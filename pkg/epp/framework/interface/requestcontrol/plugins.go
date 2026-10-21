@@ -161,3 +161,10 @@ type Responder interface {
 	// the request through the standard error path.
 	Respond(ctx context.Context, request *RequestLine, endpoints []datalayer.Endpoint) (*LocalResponse, error)
 }
+
+// PreAdmissionDataProducer prepares endpoint-independent data for flow-control classification.
+// Produce must accept a nil endpoint slice.
+type PreAdmissionDataProducer interface {
+	DataProducer
+	ProduceBeforeAdmission() bool
+}

@@ -48,6 +48,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/eviction"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -259,6 +260,36 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	}
 	tracing.SetRequestAttribution(ctx, reqCtx.SchedulingRequest.FairnessID, source)
 	tracing.AttributeRequest(ctx, span)
+
+	// Token data is required to prove that a request can bypass prefill backpressure.
+	if _, enabled := d.admissionController.(*FlowControlAdmissionController); enabled {
+		if classifier, ok := d.scheduler.(fwksched.DecodeOnlyClassifier); ok {
+			ready := true
+			for _, p := range d.requestControlPlugins.dataProducerPlugins {
+				early, ok := p.(fwkrc.PreAdmissionDataProducer)
+				if !ok || !early.ProduceBeforeAdmission() {
+					continue
+				}
+				// A timed-out producer can finish later. Keep its token writes off the queued body.
+				admissionRequest := *reqCtx.SchedulingRequest
+				admissionBody := *reqCtx.SchedulingRequest.Body
+				admissionRequest.Body = &admissionBody
+				if admissionBody.TokenizedRequest != nil {
+					tokens := *admissionBody.TokenizedRequest
+					admissionBody.TokenizedRequest = &tokens
+				}
+				if err := dataProducerPluginsWithTimeout(ctx, producerTimeout(p), []fwkrc.DataProducer{p}, &admissionRequest, nil); err != nil {
+					logger.Error(err, "failed to prepare admission data")
+					ready = false
+					break
+				}
+				reqCtx.SchedulingRequest.Body.TokenizedRequest = admissionBody.TokenizedRequest
+			}
+			if ready && classifier.DecodeOnlyBeforeAdmission(reqCtx.SchedulingRequest) {
+				reqCtx.SchedulingRequest.PutAttribute(flowcontrol.DecodeOnlyRequestAttributeKey, true)
+			}
+		}
+	}
 
 	// Admit may block until flow control admits the request.
 	if err := d.admissionController.Admit(ctx, reqCtx, priority); err != nil {

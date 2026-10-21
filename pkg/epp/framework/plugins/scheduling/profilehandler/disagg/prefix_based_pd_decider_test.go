@@ -17,6 +17,7 @@ limitations under the License.
 package disagg
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -907,4 +908,44 @@ func TestPreRequest_ClaimsConditionalDecodeAttribute(t *testing.T) {
 			assert.Equal(t, tt.wantClaim, claimed)
 		})
 	}
+}
+
+func TestHandler_DecodeOnlyBeforeAdmission(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		config       PrefixBasedPDDeciderConfig
+		tokens       int
+		prefillFirst bool
+		want         bool
+	}{
+		{name: "short suffix", config: PrefixBasedPDDeciderConfig{NonCachedTokens: 10}, tokens: 9, want: true},
+		{name: "threshold boundary", config: PrefixBasedPDDeciderConfig{NonCachedTokens: 10}, tokens: 10},
+		{name: "prompt gate", config: PrefixBasedPDDeciderConfig{NonCachedTokens: 10, PromptTokens: 20}, tokens: 19, want: true},
+		{name: "disabled decider", tokens: 100, want: true},
+		{name: "prefill first", config: PrefixBasedPDDeciderConfig{NonCachedTokens: 10}, tokens: 9, prefillFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decider, err := NewPrefixBasedPDDecider(tc.config)
+			require.NoError(t, err)
+			h := NewDisaggProfileHandler("decode", "prefill", "", decider, nil)
+			if tc.prefillFirst {
+				h.WithStageOrder(StageOrderPrefillFirst)
+			}
+			req := withTokens(makeRequestWithTokens(tc.tokens), tc.tokens)
+			require.Equal(t, tc.want, h.DecodeOnlyBeforeAdmission(req))
+			if tc.want {
+				require.False(t, decider.disaggregate(context.Background(), req, makeTestEndpoint(0)))
+			}
+		})
+	}
+	decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{NonCachedTokens: 10})
+	require.NoError(t, err)
+	h := NewDisaggProfileHandler("decode", "prefill", "", decider, nil)
+	req := makeRequestWithTokens(1)
+	req.Body.TokenizedRequest = nil
+	require.False(t, h.DecodeOnlyBeforeAdmission(req))
+	require.False(t, h.DecodeOnlyBeforeAdmission(nil))
+	h = NewDisaggProfileHandler("decode", "prefill", "", &AlwaysDisaggPDDecider{}, nil)
+	require.False(t, h.DecodeOnlyBeforeAdmission(withTokens(req, 1)))
 }

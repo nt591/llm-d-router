@@ -447,7 +447,7 @@ func (p *Processor) recordCapacityUtilization() {
 // dispatchCycle attempts to dispatch a single item by offering priority bands a dispatch opportunity in the
 // order chosen by the BandSelectionPolicy. It applies the configured policies for each band to select an item
 // and then attempts to dispatch it. It returns true if an item was successfully dispatched, and false
-// otherwise. It enforces Head-of-Line (HoL) blocking for bands the UsageLimitPolicy gates.
+// otherwise. Requests with proven decode-only work can use available decode capacity.
 //
 // # Work Conservation and Head-of-Line (HoL) Blocking
 //
@@ -477,6 +477,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	decode = append(decode, interleaved...)
 
 	saturation := -1.0
+	decodeSaturation := -1.0
 	for _, part := range []struct {
 		name      string
 		endpoints []fwkdl.Endpoint
@@ -492,6 +493,9 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 		}
 		stageSat := p.saturationDetector.Saturation(flowcontrol.WithSaturationStage(ctx, part.name), part.endpoints)
 		metrics.RecordFlowControlPoolSaturation(p.poolName, part.name, stageSat)
+		if part.name == flowcontrol.SaturationStageDecode {
+			decodeSaturation = stageSat
+		}
 		if stageSat > saturation {
 			saturation = stageSat
 		}
@@ -533,8 +537,9 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 
 	for _, i := range order {
 		priority := priorities[i]
-		// Gating is per band, so a gated band is skipped wherever it is ranked rather than ending the cycle.
-		if saturation >= ceilings[i] {
+		// Decode-only requests can use the band ceiling when prefill capacity is unavailable.
+		decodeOnly := saturation >= ceilings[i]
+		if decodeOnly && (decodeSaturation < 0 || decodeSaturation >= ceilings[i]) {
 			continue
 		}
 
@@ -544,7 +549,11 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			continue
 		}
 
-		item, err := p.selectItem(ctx, originalBand)
+		band := originalBand
+		if decodeOnly {
+			band = &eligibleBand{PriorityBandAccessor: originalBand, predicate: isDecodeOnly}
+		}
+		item, err := p.selectItem(ctx, band)
 		if err != nil {
 			p.logger.Error(err, "Failed to select item, skipping priority band for this cycle",
 				"priority", priority)

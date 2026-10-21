@@ -28,6 +28,11 @@ import (
 	"testing"
 	"time"
 
+	fctypes "github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/profilehandler/disagg"
+
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
@@ -2608,6 +2613,59 @@ func TestPrepareRequest_ConditionalDecodeDefaultDeny(t *testing.T) {
 			var e errcommon.Error
 			require.ErrorAs(t, err, &e)
 			assert.Equal(t, tt.wantErrCode, e.Code)
+		})
+	}
+}
+
+type admissionClassifyingScheduler struct {
+	*mockScheduler
+	fwksched.DecodeOnlyClassifier
+}
+
+type observingFlowController struct {
+	observe func(flowcontrol.FlowControlRequest)
+}
+
+func (f *observingFlowController) EnqueueAndWait(_ context.Context, req flowcontrol.FlowControlRequest) (fctypes.QueueOutcome, error) {
+	f.observe(req)
+	return fctypes.QueueOutcomeDispatched, nil
+}
+
+func TestDirector_ClassifiesBeforeFlowControl(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		threshold int
+		want      bool
+	}{
+		{"short prompt", 100, true},
+		{"prefill dependent", 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, ctx := newSinglePodDirector(t, nil)
+			decider, err := disagg.NewPrefixBasedPDDecider(disagg.PrefixBasedPDDeciderConfig{NonCachedTokens: tc.threshold})
+			require.NoError(t, err)
+			classifier := disagg.NewDisaggProfileHandler("decode", "prefill", "", decider, nil)
+			dir.scheduler = &admissionClassifyingScheduler{mockScheduler: &mockScheduler{scheduleErr: errors.New("stop after admission")}, DecodeOnlyClassifier: classifier}
+			producer, err := tokenizer.PluginFactory("admission-tokenizer", nil, fwkplugin.NewEppHandle(ctx, nil))
+			require.NoError(t, err)
+			datalayer.RegisterScopeSpecs([]fwkplugin.Plugin{producer})
+			dir.requestControlPlugins = *NewConfig().WithDataProducerPlugins(producer.(fwkrc.DataProducer))
+			called := false
+			fc := &observingFlowController{observe: func(req flowcontrol.FlowControlRequest) {
+				called = true
+				request := req.InferenceRequest()
+				require.NotNil(t, request.Body.TokenizedRequest)
+				only, _ := fwksched.ReadRequestAttribute[bool](request, flowcontrol.DecodeOnlyRequestAttributeKey)
+				require.Equal(t, tc.want, only)
+			}}
+			dir.admissionController = NewFlowControlAdmissionController(fc, "test-pool", dir.endpointCandidates)
+			body := []byte(`{"model":"m","prompt":"hello world"}`)
+			reqCtx := &handlers.RequestContext{Request: &handlers.Request{ID: "admission", Headers: map[string]string{":path": "/v1/completions"}, RawBody: body}, Parser: openai.NewOpenAIParser()}
+			parsed, err := reqCtx.Parser.ParseRequest(ctx, body, reqCtx.Request.Headers)
+			require.NoError(t, err)
+			_, err = dir.HandleRequest(ctx, reqCtx, parsed.Body)
+			require.Error(t, err)
+			require.True(t, called)
 		})
 	}
 }

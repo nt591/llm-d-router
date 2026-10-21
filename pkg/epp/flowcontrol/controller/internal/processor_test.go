@@ -43,6 +43,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/bandselection"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
@@ -2261,4 +2262,59 @@ func (f *fakeBandSelectionPolicy) Rank(_ context.Context, _ flowcontrol.BandSele
 
 func (f *fakeBandSelectionPolicy) RecordDispatch(_ context.Context, priority int) {
 	f.dispatched = append(f.dispatched, priority)
+}
+
+func TestProcessor_DecodeOnlyBypassesPrefill(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		decode     float64
+		ceiling    float64
+		dispatched bool
+	}{
+		{"healthy decode", 0.3, 1, true},
+		{"saturated decode", 1, 1, false},
+		{"decode at priority ceiling", 0.5, 0.5, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTestHarness(t, testCleanupTick)
+			q := h.addQueue(testFlow)
+			blocked := h.newTestItem("prefill", testFlow, testTTL)
+			require.NoError(t, q.Add(blocked))
+			h.clock.Step(time.Millisecond)
+			short := h.newTestItem("short", testFlow, testTTL)
+			req := short.OriginalRequest().(*fwkfcmocks.MockFlowControlRequest)
+			req.InferenceRequestV = &scheduling.InferenceRequest{}
+			req.InferenceRequestV.PutAttribute(flowcontrol.DecodeOnlyRequestAttributeKey, true)
+			require.NoError(t, q.Add(short))
+			h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+				fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RolePrefill}}, nil),
+				fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RoleDecode}}, nil),
+			}
+			h.saturationDetector.SaturationFunc = func(ctx context.Context, _ []fwkdl.Endpoint) float64 {
+				if flowcontrol.SaturationStageFromContext(ctx) == flowcontrol.SaturationStageDecode {
+					return tc.decode
+				}
+				return 1.5
+			}
+			calls := 0
+			h.processor.usageLimitPolicy = usagelimits.NewPolicyFunc("test-policy", func(_ context.Context, sat float64, _ []int, ceilings []float64) {
+				calls++
+				require.Equal(t, 1.5, sat)
+				for i := range ceilings {
+					ceilings[i] = tc.ceiling
+				}
+			})
+			require.Equal(t, tc.dispatched, h.processor.dispatchCycle(context.Background()))
+			require.Equal(t, 1, calls)
+			require.Nil(t, blocked.FinalState())
+			if tc.dispatched {
+				require.Equal(t, types.QueueOutcomeDispatched, short.FinalState().Outcome)
+				require.Equal(t, 1, q.Len())
+				require.Equal(t, uint64(100), q.ByteSize())
+			} else {
+				require.Nil(t, short.FinalState())
+				require.Equal(t, 2, q.Len())
+			}
+		})
+	}
 }
