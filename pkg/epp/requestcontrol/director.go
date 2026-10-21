@@ -261,35 +261,7 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	tracing.SetRequestAttribution(ctx, reqCtx.SchedulingRequest.FairnessID, source)
 	tracing.AttributeRequest(ctx, span)
 
-	// Token data is required to prove that a request can bypass prefill backpressure.
-	if _, enabled := d.admissionController.(*FlowControlAdmissionController); enabled {
-		if classifier, ok := d.scheduler.(fwksched.DecodeOnlyClassifier); ok {
-			ready := true
-			for _, p := range d.requestControlPlugins.dataProducerPlugins {
-				early, ok := p.(fwkrc.PreAdmissionDataProducer)
-				if !ok || !early.ProduceBeforeAdmission() {
-					continue
-				}
-				// A timed-out producer can finish later. Keep its token writes off the queued body.
-				admissionRequest := *reqCtx.SchedulingRequest
-				admissionBody := *reqCtx.SchedulingRequest.Body
-				admissionRequest.Body = &admissionBody
-				if admissionBody.TokenizedRequest != nil {
-					tokens := *admissionBody.TokenizedRequest
-					admissionBody.TokenizedRequest = &tokens
-				}
-				if err := dataProducerPluginsWithTimeout(ctx, producerTimeout(p), []fwkrc.DataProducer{p}, &admissionRequest, nil); err != nil {
-					logger.Error(err, "failed to prepare admission data")
-					ready = false
-					break
-				}
-				reqCtx.SchedulingRequest.Body.TokenizedRequest = admissionBody.TokenizedRequest
-			}
-			if ready && classifier.DecodeOnlyBeforeAdmission(reqCtx.SchedulingRequest) {
-				reqCtx.SchedulingRequest.PutAttribute(flowcontrol.DecodeOnlyRequestAttributeKey, true)
-			}
-		}
-	}
+	d.prepareFlowControlAdmission(ctx, reqCtx.SchedulingRequest)
 
 	// Admit may block until flow control admits the request.
 	if err := d.admissionController.Admit(ctx, reqCtx, priority); err != nil {
@@ -774,6 +746,40 @@ func (d *Director) runRequestHeaderProcessors(ctx context.Context, request *fwks
 		}
 	}
 	return nil
+}
+
+// Token data is required before enqueue to apply the decode-only admission gate.
+func (d *Director) prepareFlowControlAdmission(ctx context.Context, request *fwksched.InferenceRequest) {
+	if _, enabled := d.admissionController.(*FlowControlAdmissionController); !enabled {
+		return
+	}
+	classifier, ok := d.scheduler.(fwksched.DecodeOnlyClassifier)
+	if !ok || request == nil || request.Body == nil {
+		return
+	}
+	request.InitializeAttributeStore()
+	for _, producer := range d.requestControlPlugins.dataProducerPlugins {
+		early, ok := producer.(fwkrc.PreAdmissionDataProducer)
+		if !ok || !early.ProduceBeforeAdmission() {
+			continue
+		}
+		// A producer can finish after its timeout. Isolate its token writes from the queued request.
+		admissionRequest := *request
+		admissionBody := *request.Body
+		admissionRequest.Body = &admissionBody
+		if admissionBody.TokenizedRequest != nil {
+			tokens := *admissionBody.TokenizedRequest
+			admissionBody.TokenizedRequest = &tokens
+		}
+		if err := dataProducerPluginsWithTimeout(ctx, producerTimeout(producer), []fwkrc.DataProducer{producer}, &admissionRequest, nil); err != nil {
+			log.FromContext(ctx).Error(err, "failed to prepare admission data")
+			return
+		}
+		request.Body.TokenizedRequest = admissionBody.TokenizedRequest
+	}
+	if classifier.DecodeOnlyBeforeAdmission(request) {
+		request.PutAttribute(flowcontrol.DecodeOnlyRequestAttributeKey, true)
+	}
 }
 
 func (d *Director) runDataProducerPlugins(ctx context.Context,

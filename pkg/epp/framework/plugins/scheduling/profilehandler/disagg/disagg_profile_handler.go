@@ -654,13 +654,19 @@ func (h *Handler) DecodeOnlyBeforeAdmission(request *scheduling.InferenceRequest
 	if h.pdDecider == nil {
 		return true
 	}
-	d, ok := h.pdDecider.(*PrefixBasedPDDecider)
+	decider, ok := h.pdDecider.(*PrefixBasedPDDecider)
 	if !ok {
 		return false
 	}
-	if d.config.NonCachedTokens == 0 {
+	if decider.config.NonCachedTokens == 0 {
 		return true
 	}
 	tokens, err := getUserInputLenInTokens(request)
-	return err == nil && (tokens < d.config.NonCachedTokens || (d.config.PromptTokens > 0 && tokens < d.config.PromptTokens))
+	if err != nil {
+		return false
+	}
+	if tokens < decider.config.NonCachedTokens {
+		return true
+	}
+	return decider.config.PromptTokens > 0 && tokens < decider.config.PromptTokens
 }

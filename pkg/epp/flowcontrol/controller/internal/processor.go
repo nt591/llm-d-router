@@ -444,18 +444,9 @@ func (p *Processor) recordCapacityUtilization() {
 	}
 }
 
-// dispatchCycle attempts to dispatch a single item by offering priority bands a dispatch opportunity in the
-// order chosen by the BandSelectionPolicy. It applies the configured policies for each band to select an item
-// and then attempts to dispatch it. It returns true if an item was successfully dispatched, and false
-// otherwise. Requests with proven decode-only work can use available decode capacity.
-//
-// # Work Conservation and Head-of-Line (HoL) Blocking
-//
-// The cycle attempts to be work-conserving by skipping bands where selection fails.
-// A band gated by its usage ceiling is skipped for the same reason: dispatching it would exacerbate the
-// saturation holding back higher-priority work. Ceilings are monotonically non-increasing across descending
-// priority, so gated bands form a contiguous tail and a skip under strict order only ever reaches further
-// gated bands.
+// dispatchCycle dispatches at most one request using the configured band and fairness policies.
+// A closed combined gate permits only proven decode-only work when decode is below the band ceiling.
+// UsageLimitPolicy runs once per cycle because dispatch pacing policies count calls as cycles.
 func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	dispatchCycleStart := time.Now()
 	defer func() {
@@ -538,8 +529,8 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	for _, i := range order {
 		priority := priorities[i]
 		// Decode-only requests can use the band ceiling when prefill capacity is unavailable.
-		decodeOnly := saturation >= ceilings[i]
-		if decodeOnly && (decodeSaturation < 0 || decodeSaturation >= ceilings[i]) {
+		restrictToDecodeOnly := saturation >= ceilings[i]
+		if restrictToDecodeOnly && (decodeSaturation < 0 || decodeSaturation >= ceilings[i]) {
 			continue
 		}
 
@@ -550,7 +541,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 		}
 
 		band := originalBand
-		if decodeOnly {
+		if restrictToDecodeOnly {
 			band = &eligibleBand{PriorityBandAccessor: originalBand, predicate: isDecodeOnly}
 		}
 		item, err := p.selectItem(ctx, band)

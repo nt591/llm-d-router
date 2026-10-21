@@ -2271,9 +2271,9 @@ func TestProcessor_DecodeOnlyBypassesPrefill(t *testing.T) {
 		ceiling    float64
 		dispatched bool
 	}{
-		{"healthy decode", 0.3, 1, true},
-		{"saturated decode", 1, 1, false},
-		{"decode at priority ceiling", 0.5, 0.5, false},
+		{name: "healthy decode", decode: 0.3, ceiling: 1, dispatched: true},
+		{name: "saturated decode", decode: 1, ceiling: 1},
+		{name: "decode at priority ceiling", decode: 0.5, ceiling: 0.5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newTestHarness(t, testCleanupTick)

@@ -28,11 +28,6 @@ import (
 	"testing"
 	"time"
 
-	fctypes "github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/profilehandler/disagg"
-
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
@@ -62,16 +57,20 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
 	fccontractmocks "github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts/mocks"
+	fctypes "github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/inflightload"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/anthropic"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
 	sessionaffinityfilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sessionaffinity"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/profilehandler/disagg"
 	sessionaffinityscorer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/handlers"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
@@ -2637,15 +2636,18 @@ func TestDirector_ClassifiesBeforeFlowControl(t *testing.T) {
 		threshold int
 		want      bool
 	}{
-		{"short prompt", 100, true},
-		{"prefill dependent", 1, false},
+		{name: "short prompt", threshold: 100, want: true},
+		{name: "prefill dependent", threshold: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir, ctx := newSinglePodDirector(t, nil)
 			decider, err := disagg.NewPrefixBasedPDDecider(disagg.PrefixBasedPDDeciderConfig{NonCachedTokens: tc.threshold})
 			require.NoError(t, err)
 			classifier := disagg.NewDisaggProfileHandler("decode", "prefill", "", decider, nil)
-			dir.scheduler = &admissionClassifyingScheduler{mockScheduler: &mockScheduler{scheduleErr: errors.New("stop after admission")}, DecodeOnlyClassifier: classifier}
+			dir.scheduler = &admissionClassifyingScheduler{
+				mockScheduler:        &mockScheduler{scheduleErr: errors.New("stop after admission")},
+				DecodeOnlyClassifier: classifier,
+			}
 			producer, err := tokenizer.PluginFactory("admission-tokenizer", nil, fwkplugin.NewEppHandle(ctx, nil))
 			require.NoError(t, err)
 			datalayer.RegisterScopeSpecs([]fwkplugin.Plugin{producer})
@@ -2660,7 +2662,14 @@ func TestDirector_ClassifiesBeforeFlowControl(t *testing.T) {
 			}}
 			dir.admissionController = NewFlowControlAdmissionController(fc, "test-pool", dir.endpointCandidates)
 			body := []byte(`{"model":"m","prompt":"hello world"}`)
-			reqCtx := &handlers.RequestContext{Request: &handlers.Request{ID: "admission", Headers: map[string]string{":path": "/v1/completions"}, RawBody: body}, Parser: openai.NewOpenAIParser()}
+			reqCtx := &handlers.RequestContext{
+				Request: &handlers.Request{
+					ID:      "admission",
+					Headers: map[string]string{":path": "/v1/completions"},
+					RawBody: body,
+				},
+				Parser: openai.NewOpenAIParser(),
+			}
 			parsed, err := reqCtx.Parser.ParseRequest(ctx, body, reqCtx.Request.Headers)
 			require.NoError(t, err)
 			_, err = dir.HandleRequest(ctx, reqCtx, parsed.Body)
@@ -2668,4 +2677,55 @@ func TestDirector_ClassifiesBeforeFlowControl(t *testing.T) {
 			require.True(t, called)
 		})
 	}
+}
+
+type delayedAdmissionProducer struct {
+	*mockDataProducerPlugin
+	started  chan struct{}
+	release  chan struct{}
+	finished chan struct{}
+}
+
+func (p *delayedAdmissionProducer) ProduceBeforeAdmission() bool  { return true }
+func (p *delayedAdmissionProducer) ProduceTimeout() time.Duration { return 10 * time.Millisecond }
+func (p *delayedAdmissionProducer) Produce(_ context.Context, request *fwksched.InferenceRequest, _ []fwksched.Endpoint) error {
+	close(p.started)
+	<-p.release
+	request.Body.TokenizedRequest = &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: []uint32{1}}}}
+	close(p.finished)
+	return nil
+}
+
+func TestDirector_AdmissionProducerTimeoutIsolatesTokens(t *testing.T) {
+	producer := &delayedAdmissionProducer{
+		mockDataProducerPlugin: newMockDataProducerPlugin("delayed-admission"),
+		started:                make(chan struct{}),
+		release:                make(chan struct{}),
+		finished:               make(chan struct{}),
+	}
+	datalayer.RegisterScopeSpecs([]fwkplugin.Plugin{producer})
+	decider, err := disagg.NewPrefixBasedPDDecider(disagg.PrefixBasedPDDeciderConfig{NonCachedTokens: 10})
+	require.NoError(t, err)
+	dir := &Director{
+		admissionController:   &FlowControlAdmissionController{},
+		scheduler:             &admissionClassifyingScheduler{DecodeOnlyClassifier: disagg.NewDisaggProfileHandler("decode", "prefill", "", decider, nil)},
+		requestControlPlugins: *NewConfig().WithDataProducerPlugins(producer),
+	}
+	request := &fwksched.InferenceRequest{Body: &fwkrh.InferenceRequestBody{}}
+	dir.prepareFlowControlAdmission(t.Context(), request)
+	select {
+	case <-producer.started:
+	case <-time.After(time.Second):
+		t.Fatal("producer did not start")
+	}
+	require.Nil(t, request.Body.TokenizedRequest)
+	_, classified := request.GetAttribute(flowcontrol.DecodeOnlyRequestAttributeKey)
+	require.False(t, classified)
+	close(producer.release)
+	select {
+	case <-producer.finished:
+	case <-time.After(time.Second):
+		t.Fatal("producer did not finish")
+	}
+	require.Nil(t, request.Body.TokenizedRequest)
 }

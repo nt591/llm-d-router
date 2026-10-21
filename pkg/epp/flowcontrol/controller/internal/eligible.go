@@ -58,7 +58,10 @@ func (b *eligibleBand) eligible(q flowcontrol.FlowQueueAccessor) flowcontrol.Flo
 func (b *eligibleBand) IterateQueues(callback func(flowcontrol.FlowQueueAccessor) bool) {
 	b.PriorityBandAccessor.IterateQueues(func(q flowcontrol.FlowQueueAccessor) bool {
 		eligible := b.eligible(q)
-		return eligible == nil || callback(eligible)
+		if eligible == nil {
+			return true
+		}
+		return callback(eligible)
 	})
 }
 

@@ -163,7 +163,9 @@ type Responder interface {
 }
 
 // PreAdmissionDataProducer prepares endpoint-independent data for flow-control classification.
-// Produce must accept a nil endpoint slice.
+// Produce must accept a nil endpoint slice and modify only Body.TokenizedRequest.
+// Other body fields and token slices are shared with the queued request and must remain read-only.
+// Produced token data is retained for the ordinary data-producer phase.
 type PreAdmissionDataProducer interface {
 	DataProducer
 	ProduceBeforeAdmission() bool

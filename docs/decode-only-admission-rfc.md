@@ -2,28 +2,37 @@
 
 ## Problem
 
-Flow control measures prefill and decode saturation separately, then uses their maximum to gate each priority band. Admission finishes before token production and decode selection. A request that the PD decider would send directly to decode therefore waits when prefill is saturated, even if decode has capacity.
+The combined admission gate uses the greater of prefill and decode saturation for every request. It cannot tell whether a request requires remote prefill. If prefill saturation is 1.5, decode saturation is 0.3, and the priority ceiling is 1.0, the combined gate blocks requests that could run entirely on decode.
 
-## Draft behavior
+## Admission and dispatch
 
-Endpoint-independent token production runs before flow-control admission. The decode-first disaggregation handler proves that remote prefill is unnecessary when the decider is disabled or the prompt is below either configured token threshold. Missing token data and decisions that depend on a selected pod's cache remain subject to both stages. Prefill-first configurations and configurations with an encode decider retain the combined gate.
+1. Run token producers that support execution before admission. They receive no endpoint candidates.
+2. Ask the decode-first disaggregation handler whether the request can run without remote prefill. It returns true when no prefill decider is configured, the prefix-based decider is disabled, or the prompt is below a configured token threshold. Cache-dependent decisions remain unclassified.
+3. Enqueue the request in its existing flow queue with the classification attached.
+4. If the combined gate closes the band but decode is below its ceiling, expose only classified requests to the existing fairness policy. The policy selects a flow, then dispatch uses that flow's first eligible request under its ordering policy.
 
-When combined saturation closes a band but decode saturation is below its ceiling, selection exposes only proven decode-only requests to the existing fairness policy. Each flow retains its identity, ordering policy, queue capacity, and TTL. The matching queue operation selects the earliest eligible item under the configured ordering policy without removing blocked work. It scans the queue under a read lock, so its cost is linear in queue length.
+In the example above, a classified short request can dispatch while a prefill-dependent request in the same flow remains queued. Decode saturation at or above the ceiling blocks both requests.
 
-Token production uses a separate body copy before admission. A producer that completes after its timeout cannot publish token data into the queued body. Successful token data is retained for scheduling.
+Each flow keeps its identity, queue capacity accounting, ordering policy, and TTL. Eligible requests can pass blocked work; ordering still applies among eligible requests. Matching selection scans the queue under a read lock and costs O(n) for a queue with n requests. Custom queues without matching selection can bypass only when their first request is eligible.
 
-## Policy limitation
+## Producer contract
 
-UsageLimitPolicy runs once per dispatch cycle with combined saturation. Saturation-dependent policies can still close lower-priority bands because of prefill load. The draft proves bypass with the default static policy and preserves the pacing contract for other policies. Complete stage-specific priority policy evaluation requires a contract that computes both stage views in one cycle without advancing policy state twice.
+Early producers may modify only `Body.TokenizedRequest`. Other body fields and token slices are shared and must remain read-only. The director gives each invocation a separate body and token struct, and retains its token result only after successful completion. A producer that finishes after its timeout cannot replace the queued body's token data. Scheduling reuses successful token data.
 
-Dispatch reservations remain pool-wide. Pending decode-only dispatches can briefly contribute to prefill saturation until PreRequest publishes their endpoint accounting.
+Token production happens before enqueue, so its execution time is outside the queue TTL. Render-backed tokenizers can issue requests to their configured service during this phase. The request context and producer timeout bound those calls.
+
+## Policy limits
+
+`UsageLimitPolicy` receives combined saturation once per dispatch cycle. Saturation-dependent policies can still close lower-priority bands because of prefill load. The default static policy permits the bypass described here. Evaluating priority policies separately for each stage requires a contract that produces both views without advancing dispatch pacing state twice.
+
+Dispatch reservations remain pool-wide. Pending decode-only dispatches can briefly contribute to prefill saturation until `PreRequest` publishes their endpoint accounting.
 
 ## Scope
 
-This draft covers prompt-threshold decisions. Long prompts with a short uncached suffix require a decode selection before classification and revalidation after queue wait. This draft does not classify those requests as decode-only.
+This draft covers prompt-threshold decisions. Long prompts with a short uncached suffix require decode selection before classification and revalidation after queue wait. Missing token data, prefill-first configurations, configurations with an encode decider, and unsupported prefill deciders retain the combined gate. A disabled or absent prefill decider needs no token data to prove that remote prefill is unnecessary.
 
-No public API configuration or dependency changes are required. Custom queue implementations that do not support matching selection can bypass only when their first request is eligible.
+No API configuration or dependency changes are required.
 
 ## Validation
 
-Regression tests cover a decode-only request behind prefill-dependent work, saturated decode capacity, a priority ceiling, token threshold boundaries, classification before enqueue, and selection that preserves queue accounting and handles. Existing tests cover the combined gate for unclassified work.
+Tests verify that a short request passes queued prefill-dependent work through the real flow controller and registry, and that blocked work dispatches when capacity returns. They also cover saturated decode capacity, priority ceilings, threshold boundaries, classification before enqueue, late token writes after a producer timeout, and matching selection that preserves queue accounting and handles.
