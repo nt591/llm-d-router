@@ -367,3 +367,27 @@ func (m *MockManagedQueue) Peek() flowcontrol.QueueItemAccessor {
 	}
 	return nil // Queue is empty
 }
+
+func (m *MockManagedQueue) PeekMatching(predicate func(flowcontrol.QueueItemAccessor) bool) flowcontrol.QueueItemAccessor {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.init()
+	var best flowcontrol.QueueItemAccessor
+	for _, item := range m.items {
+		if !predicate(item) {
+			continue
+		}
+		if best == nil {
+			best = item
+			continue
+		}
+		before := item.EnqueueTime().Before(best.EnqueueTime())
+		if m.OrderingPolicyFunc != nil {
+			before = m.OrderingPolicyFunc().Less(item, best)
+		}
+		if before {
+			best = item
+		}
+	}
+	return best
+}

@@ -152,6 +152,18 @@ func (pq *priorityQueue) Peek() flowcontrol.QueueItemAccessor {
 	return pq.heap.items[0].item
 }
 
+func (pq *priorityQueue) PeekMatching(predicate func(flowcontrol.QueueItemAccessor) bool) flowcontrol.QueueItemAccessor {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	var best flowcontrol.QueueItemAccessor
+	for _, hi := range pq.heap.items {
+		if predicate(hi.item) && (best == nil || pq.heap.policy.Less(hi.item, best)) {
+			best = hi.item
+		}
+	}
+	return best
+}
+
 // Add adds an item to the queue.
 // Time complexity: O(log n).
 func (pq *priorityQueue) Add(item flowcontrol.QueueItemAccessor) {

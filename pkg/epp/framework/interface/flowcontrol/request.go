@@ -20,6 +20,7 @@ package flowcontrol
 import (
 	"time"
 
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
@@ -74,6 +75,10 @@ type FlowControlRequest interface {
 	// TargetModelName returns the name of the specific adapter or traffic target (e.g., "finance-lora-v1").
 	TargetModelName() string
 }
+
+// DecodeOnlyRequestAttributeKey marks requests that cannot require remote prefill.
+// An absent value keeps admission subject to both stages.
+var DecodeOnlyRequestAttributeKey = plugin.NewDataKey("decode-only-request", "")
 
 // QueueItemHandle is an opaque handle to an item that has been successfully added to a SafeQueue. It acts as a key,
 // allowing the `controller.FlowController` to perform targeted operations (like removal) on a specific item without

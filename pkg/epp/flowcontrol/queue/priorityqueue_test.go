@@ -486,3 +486,25 @@ func TestPriorityQueue_ByteSize_BookedAtAdd(t *testing.T) {
 		assert.Equal(t, 1, q.Len())
 	})
 }
+
+func TestPriorityQueue_PeekMatching(t *testing.T) {
+	t.Parallel()
+	q := newPriorityQueue(enqueueTimePolicy)
+	now := time.Now()
+	blocked := itemAt(10, "blocked", now)
+	first := itemAt(20, "first", now.Add(time.Second))
+	last := itemAt(30, "last", now.Add(2*time.Second))
+	for _, item := range []*mocks.MockQueueItemAccessor{last, blocked, first} {
+		q.Add(item)
+	}
+	match := func(item flowcontrol.QueueItemAccessor) bool { return item != blocked }
+	require.Same(t, first, q.PeekMatching(match))
+	require.Same(t, blocked, q.Peek())
+	require.Equal(t, 3, q.Len())
+	require.Equal(t, uint64(60), q.ByteSize())
+	require.False(t, first.Handle().IsInvalidated())
+	_, err := q.Remove(first.Handle())
+	require.NoError(t, err)
+	require.Same(t, last, q.PeekMatching(match))
+	require.Nil(t, q.PeekMatching(func(flowcontrol.QueueItemAccessor) bool { return false }))
+}

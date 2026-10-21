@@ -170,3 +170,8 @@ func runSchedulerProfile(ctx context.Context, name string, profile fwksched.Sche
 
 	return profile.Run(profileCtx, request, candidateEndpoints)
 }
+
+func (s *Scheduler) DecodeOnlyBeforeAdmission(request *fwksched.InferenceRequest) bool {
+	classifier, ok := s.profileHandler.(fwksched.DecodeOnlyClassifier)
+	return ok && classifier.DecodeOnlyBeforeAdmission(request)
+}

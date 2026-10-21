@@ -517,3 +517,5 @@ func ConvertMMFeaturesFromUpstream(features []fwkrh.MultiModalFeature) (map[stri
 	}
 	return hashes, ranges
 }
+
+func (p *Plugin) ProduceBeforeAdmission() bool { return true }

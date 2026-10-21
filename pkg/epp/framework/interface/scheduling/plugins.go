@@ -56,6 +56,13 @@ type ProfileHandler interface {
 		profileResults map[string]*ProfileRunResult) (*SchedulingResult, error)
 }
 
+// DecodeOnlyClassifier evaluates remote-prefill requirements before any pod is selected.
+// Return true only when the request cannot require remote prefill.
+// Unknown decisions return false.
+type DecodeOnlyClassifier interface {
+	DecodeOnlyBeforeAdmission(request *InferenceRequest) bool
+}
+
 // Filter defines the interface for filtering a list of pods based on context.
 type Filter interface {
 	plugin.Plugin

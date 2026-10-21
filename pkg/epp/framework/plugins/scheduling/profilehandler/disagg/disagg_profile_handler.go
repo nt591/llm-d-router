@@ -645,3 +645,28 @@ func (h *Handler) PreRequest(ctx context.Context, request *scheduling.InferenceR
 	)
 	return nil
 }
+
+// DecodeOnlyBeforeAdmission excludes cache-dependent decisions because no decode pod is selected.
+func (h *Handler) DecodeOnlyBeforeAdmission(request *scheduling.InferenceRequest) bool {
+	if request == nil || request.Body == nil || h.stageOrder == StageOrderPrefillFirst || h.encodeDecider != nil {
+		return false
+	}
+	if h.pdDecider == nil {
+		return true
+	}
+	decider, ok := h.pdDecider.(*PrefixBasedPDDecider)
+	if !ok {
+		return false
+	}
+	if decider.config.NonCachedTokens == 0 {
+		return true
+	}
+	tokens, err := getUserInputLenInTokens(request)
+	if err != nil {
+		return false
+	}
+	if tokens < decider.config.NonCachedTokens {
+		return true
+	}
+	return decider.config.PromptTokens > 0 && tokens < decider.config.PromptTokens
+}

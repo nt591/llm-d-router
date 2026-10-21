@@ -18,6 +18,7 @@ package requestcontrol
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/globalstrict"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/ordering/fcfs"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	"github.com/llm-d/llm-d-router/pkg/epp/handlers"
 	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
@@ -60,6 +62,7 @@ type realFlowControlHarness struct {
 // requests queued), the candidate pool (empty vs. non-empty steers capacity-rejection
 // classification), the controller-default request TTL, and an optional per-band request cap.
 type realFlowControlOpts struct {
+	saturationFunc  func(context.Context, []fwkdl.Endpoint) float64
 	saturation      float64
 	candidates      []fwkdl.Endpoint
 	requestTTL      time.Duration // Defaults to one minute (effectively "never" for these tests).
@@ -98,6 +101,9 @@ func newRealFlowControlHarness(t *testing.T, opts realFlowControlOpts) *realFlow
 	}
 	detector := &mockSaturationDetector{
 		SaturationFunc: func(context.Context, []fwkdl.Endpoint) float64 { return opts.saturation },
+	}
+	if opts.saturationFunc != nil {
+		detector.SaturationFunc = opts.saturationFunc
 	}
 	candidates := &mocks.MockEndpointCandidates{Candidates: opts.candidates}
 	fc := fccontroller.NewFlowController(ctx, "test-pool", &fccontroller.Config{
@@ -296,4 +302,37 @@ func TestFlowControlAdmissionController_RealControllerSeam(t *testing.T) {
 		err := waitAdmit(t, admitAsync(ctx, h.ac, "shutdown-req"))
 		requireDropped(t, err, errcommon.ServiceUnavailable, errcommon.RequestDroppedReasonShuttingDown)
 	})
+}
+
+func TestFlowControlAdmissionController_DecodeOnlyBypassesPrefill(t *testing.T) {
+	var prefillHealthy atomic.Bool
+	h := newRealFlowControlHarness(t, realFlowControlOpts{
+		candidates: []fwkdl.Endpoint{
+			fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RolePrefill}}, nil),
+			fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RoleDecode}}, nil),
+		},
+		saturationFunc: func(ctx context.Context, _ []fwkdl.Endpoint) float64 {
+			if flowcontrol.SaturationStageFromContext(ctx) == flowcontrol.SaturationStageDecode || prefillHealthy.Load() {
+				return 0.3
+			}
+			return 1.5
+		},
+	})
+	ctx := t.Context()
+	blocked := admitAsync(ctx, h.ac, "prefill")
+	require.Eventually(t, func() bool { return h.reg.Stats().Global.Len == 1 }, time.Second, time.Millisecond)
+	short := newSeamRequestContext("short")
+	short.SchedulingRequest.PutAttribute(flowcontrol.DecodeOnlyRequestAttributeKey, true)
+	admitted := make(chan error, 1)
+	go func() { admitted <- h.ac.Admit(ctx, short, 0) }()
+	require.NoError(t, waitAdmit(t, admitted))
+	require.EqualValues(t, 1, h.reg.Stats().Global.Len)
+	select {
+	case err := <-blocked:
+		t.Fatalf("prefill request finished under saturation: %v", err)
+	default:
+	}
+	prefillHealthy.Store(true)
+	require.NoError(t, waitAdmit(t, blocked))
+	require.Zero(t, h.reg.Stats().Global.Len)
 }
